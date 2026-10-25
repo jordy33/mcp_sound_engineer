@@ -24,7 +24,23 @@ if [ "$WANT" != "$HAVE" ]; then
   echo "$WANT" > "$STAMP"
 fi
 
+RUN=".run"; mkdir -p "$RUN"; PIDFILE="$RUN/engineer.pid"
+is_running() { [ -f "$PIDFILE" ] && kill -0 "$(cat "$PIDFILE" 2>/dev/null)" 2>/dev/null; }
+
 case "${1:-}" in
+  --status)
+    if is_running; then echo "[engineer] running (pid $(cat "$PIDFILE"))"; else echo "[engineer] not running"; fi
+    exit 0 ;;
+  --stop)
+    if is_running; then
+      kill "$(cat "$PIDFILE")" 2>/dev/null && echo "[engineer] stopped (pid $(cat "$PIDFILE"))"
+    else
+      echo "[engineer] not running"
+    fi
+    rm -f "$PIDFILE"; exit 0 ;;
+  --restart)
+    if is_running; then kill "$(cat "$PIDFILE")" 2>/dev/null; sleep 1; rm -f "$PIDFILE"; fi
+    shift || true ;;
   --test)  shift; exec "$VENV/bin/python" tests/test_smoke.py "$@" ;;
 esac
 
@@ -33,6 +49,7 @@ if [ ! -f .env ]; then
   echo "[engineer] .env created — put your JEV_API_KEY in it, then run again"
 fi
 
+echo $$ > "$PIDFILE"
 case "${1:-}" in
   --stdio) shift; exec "$VENV/bin/python" server/engineer_server.py "$@" ;;
   --http)  shift; exec "$VENV/bin/python" server/engineer_server.py --http "$@" ;;

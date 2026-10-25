@@ -230,7 +230,15 @@ def serve_http(port: int = 8766) -> None:
         def log_message(self, *args):  # silence per-request logging
             pass
 
-    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    try:
+        srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    except OSError as exc:
+        if getattr(exc, "errno", None) == 48:
+            print(f"[engineer] port {port} is already in use.", flush=True)
+            print("[engineer]   stop it:  ./start-sound-engineer-mcp.sh --stop", flush=True)
+            print(f"[engineer]   or use:   ./start-sound-engineer-mcp.sh --port {port + 1}", flush=True)
+            raise SystemExit(2)
+        raise
     cfg = config()
     print(f"[engineer] listening on http://127.0.0.1:{port}", flush=True)
     print("[engineer]   MCP JSON-RPC : POST /mcp", flush=True)
