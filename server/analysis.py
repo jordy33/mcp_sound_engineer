@@ -58,14 +58,39 @@ def bands_db_rel(mono: np.ndarray, sr: int) -> dict[str, float]:
 
 
 def integrated_lufs(mono: np.ndarray, sr: int) -> float:
-    """Approximate BS.1770 integrated loudness (K-weighting + gated blocks)."""
+    """BS.1770 integrated loudness: K-weighting + 400 ms gating (absolute and relative).
+
+    The gating matters: without it, silence and quiet intros drag the number down and
+    the same master reads differently depending on how much air it has at the edges.
+    """
     try:
-        import pyloudnorm as pyln  # optional, exact
+        import pyloudnorm as pyln  # exact, optional
         return round(float(pyln.Meter(sr).integrated_loudness(mono)), 2)
     except Exception:
         pass
-    # fallback: K-weighting applied in the frequency domain (same magnitude response,
-    # no per-sample Python loop — ~40x faster on long files)
+
+    y = _k_weighted(mono, sr)
+    block = int(0.4 * sr)
+    if len(y) < block:
+        return round(-0.691 + 10 * np.log10(float(np.mean(y ** 2)) + 1e-20), 2)
+
+    step = max(1, block // 4)
+    starts = range(0, len(y) - block + 1, step)
+    powers = np.array([float(np.mean(y[i:i + block] ** 2)) for i in starts]) + 1e-20
+    block_lufs = -0.691 + 10 * np.log10(powers)
+
+    gated = powers[block_lufs > -70.0]                      # absolute gate
+    if gated.size == 0:
+        return -70.0
+    relative = -0.691 + 10 * np.log10(float(np.mean(gated))) - 10.0
+    keep = gated[(-0.691 + 10 * np.log10(gated)) > relative]  # relative gate
+    if keep.size == 0:
+        keep = gated
+    return round(-0.691 + 10 * np.log10(float(np.mean(keep))), 2)
+
+
+def _k_weighted(mono: np.ndarray, sr: int) -> np.ndarray:
+    """K-weighting in the frequency domain (same magnitude response as the biquads)."""
     x = mono.astype(np.float64)
     n = len(x)
     spec = np.fft.rfft(x)
@@ -80,9 +105,7 @@ def integrated_lufs(mono: np.ndarray, sr: int) -> float:
                  np.array([1.0, -1.69065929318241, 0.73248077421585]))
     h *= response(np.array([1.0, -2.0, 1.0]),
                   np.array([1.0, -1.99004745483398, 0.99007225036621]))
-    y = np.fft.irfft(spec * h, n=n)
-    rms = np.sqrt(np.mean(y ** 2) + 1e-18)
-    return round(-0.691 + 20 * np.log10(rms + 1e-15), 2)
+    return np.fft.irfft(spec * h, n=n)
 
 
 def true_peak_dbtp(mono: np.ndarray, sr: int, oversample: int = 4) -> float:

@@ -96,84 +96,76 @@ Register it in any MCP client, next to your DAW adapter — they are separate se
 ## 5. The rules, and where they live
 
 Sources: the [mastering-engineer methodology](https://github.com/fadelabs/phantom/blob/main/plugin/skills/mastering-engineer/SKILL.md)
-(send-back gates, ten-stage chain, parameter ranges) and the
-[2026 platform loudness targets](https://www.forasoft.com/learn/downloads/lufs-targets-per-platform-cheatsheet).
+(send-back gates, ten-stage chain, parameter ranges) and a third-party
+[2026 loudness cheat sheet](https://www.forasoft.com/learn/downloads/lufs-targets-per-platform-cheatsheet)
+that has **not** been checked against primary platform docs.
 
-Everything numeric lives in [`server/rules.py`](server/rules.py); the wording lives in the question
-schemas in [`server/engineer_server.py`](server/engineer_server.py).
+Everything numeric lives in [`server/rules.py`](server/rules.py), together with the question schemas:
+one source of truth for both the numbers and the answer keys.
 
-| Rule | Value | In code | Wired? |
+| Rule | Value | In code | Behaviour |
 |---|---|---|---|
-| Corrective EQ per point | ≤ 3 dB | `GATE.max_corrective_db_per_point` | ✅ clamps `eq.bell` |
-| Cumulative corrective EQ | ≤ 6 dB | `GATE.max_cumulative_corrective_db` | ✅ running total in `build_master_recipe` |
-| Phase correlation | < +0.3 → send back | `GATE.min_phase_correlation` | ✅ measured guard |
-| Clipping that blocks mastering | ≥ 500 samples or ≥ 0.01 % | `MIN_CLIPPED_SAMPLES`, `MIN_CLIPPED_PROPORTION` | ✅ measured guard |
-| Already a finished master | LRA < 4 LU **and** TP > −1 **and** LUFS > −12 | `MAX_LRA_FINISHED` | ✅ measured guard |
-| Model gate threshold | 0.8 | `GATE_THRESHOLD` | ✅ |
-| Broadband compression | 1.5–3:1, 10–30 ms, ≤ 3 dB GR | `CHAIN`, `GATE.max_gain_reduction_db` | ⚠️ recipe emits ratio/attack; GR comes from `dynamics_amount` |
-| Limiter | ceiling −1.0 dBTP, ≤ 4 dB GR | `PLATFORMS`, `GATE.max_limiter_gr_db` | ✅ |
-| Dither last | always | `CHAIN` | ✅ last action |
-| Playback normalization vs delivery ceiling | Spotify −14 LUFS *reference*, ceiling −1 dBTP; CD 16-bit + dither | `PLATFORMS`, `loudness_warnings` | ✅ reference is informational, ceiling is enforced |
-| Noise floor | > −50 dB → send back | `GATE.noise_floor_*` | ❌ no detector yet |
-| Lossy source | cliff > 20 dB above HF shelf | `GATE.lossy_shelf_drop_db` | ❌ no detector yet |
-| Ten-stage chain order | HPF → … → dither | `CHAIN` | ⚠️ documented, not enforced as a pipeline |
+| Phase correlation | < +0.3 | `GATE.min_phase_correlation` | **measured** → `send_back` |
+| Clipping that blocks mastering | ≥ 500 frames **and** ≥ 0.01 % | `MIN_CLIPPED_*` | **measured** → `send_back` |
+| Already a finished master | LRA < 4 **and** TP > −1 **and** LUFS > −12 | `MAX_LRA_FINISHED` | **measured** → `send_back` (product rule) |
+| Corrective EQ per point | ≤ 3 dB | `GATE.max_corrective_db_per_point` | over the cap → `send_back`, never clamped |
+| Cumulative corrective EQ | ≤ 6 dB | `GATE.max_cumulative_corrective_db` | includes the sibilance cut |
+| Broadband compression | 1.5–3:1, 10–30 ms, 1–3 dB GR | `CHAIN`, `GATE.min/max_gain_reduction_db` | emitted on the master bus |
+| De-esser | after compression | `CHAIN` | emitted after the compressor |
+| Limiter | ceiling from the destination, GR computed | `expected_limiter_gr` | arithmetic from measured LUFS, not a model score |
+| Dither | only when reducing to a fixed bit depth | `PLATFORMS[...]["dither"]` | none for streaming, TPDF for CD/podcast |
+| Playback normalization | Spotify −14, Apple −16, … | `PLATFORMS` | informational; never a delivery target |
+| Unknown destination | — | `loudness_target` | raises, no silent fallback |
+| Reference curve | normalized so the six bands sum to 0 dB | `REFERENCE_CURVE` | linear sum = 1.0 |
+| Noise floor | > −50 dB | `GATE.noise_floor_*` | ❌ no detector |
+| Lossy source | cliff > 20 dB | `GATE.lossy_shelf_drop_db` | ❌ no detector |
 | `eq.shelf`, `dynamic_eq`, `stereo.width`, `pan` | vocabulary only | `ACTIONS` | ❌ never emitted |
 
-The ❌ rows are honest gaps: the constant exists, the detector does not. They are listed in
-[`docs/LIMITS.md`](docs/LIMITS.md) and in §8.
+**The decision model never gates.** It scores and chooses treatments; every refusal is measured.
+Asking it "should this be sent back?" produced a global yes/no that contradicted its own
+component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "slight").
 
 ### How to know a rule is real
 
-Claims in this README are worth nothing; the tests are the contract.
-
 ```bash
-./start-sound-engineer-mcp.sh --test     # smoke + 12 domain assertions
+./start-sound-engineer-mcp.sh --test     # 36 assertions: smoke + rules + analysis
 ```
 
-`tests/test_rules.py` encodes the domain, not the implementation:
+`tests/test_rules.py` asserts behaviour, not arithmetic:
 
-* streaming loudness is a **playback reference** — no `target_lufs` may exist anywhere;
-* CD is 16-bit + TPDF, streaming is 24-bit + no dither;
-* corrective EQ never exceeds 3 dB per point and 6 dB total;
-* gain reduction never exceeds 3 dB, limiter never exceeds 4 dB;
-* `send_back` is terminal; an unmastered mix is never refused;
-* every `GATE` constant is either enforced or listed in `UNIMPLEMENTED_GATES` — a rule cannot be
-  documented but unwired without failing the suite.
+* every balance label lowers the offender, and a fader points at a real exported stem;
+* a corrective request above 3 dB returns `send_back` instead of a clamped band;
+* 60 clipped frames in 10 s do **not** send back, 5000 do;
+* `dither` never appears for a streaming destination;
+* the two recipe builders reject any answer key missing from their schema (this is the test that
+  catches a `low_end` / `low_mid` mismatch);
+* an unknown destination or unknown action target raises instead of falling back.
 
-When you change a rule, break it on purpose first: reintroduce the wrong value and confirm the suite
-goes red. If it stays green, the test is decoration.
+`tests/test_analysis.py` uses signals whose correct value is known: a 997 Hz sine at −20 dBFS must
+read −20 LUFS ±1, a 440 Hz sine must show 3.01 dB crest, inverted channels must correlate at −1.0,
+and trailing silence must not change integrated loudness by more than 1 LU (BS.1770 gating).
+
+When you change a rule, break it on purpose first. If the suite stays green, the test is decoration.
 
 ### Adding a rule
 
-Three edits, no config files:
-
-1. **The number** → `server/rules.py`, in `GATE` (a cap) or `PLATFORMS`/`REFERENCE_CURVE` (a target).
-2. **The judgement** → the question dict in `server/engineer_server.py`
-   (`MASTER_QUESTIONS` or `MIX_QUESTIONS`). Use `noul` for gates, `score` 2–10 levels for magnitudes,
-   `choice` for treatments — and write `instructions` that reference the measured fields, so the
-   model judges the numbers rather than guessing from genre.
-3. **The action** → `build_master_recipe` / `build_mix_recipe`, emitting a `_action(...)` from
-   `ACTIONS`. Clamp it with the cap you added in step 1; never trust the model to respect it.
-
-Then `./start-sound-engineer-mcp.sh --test` and a real call:
-
-```bash
-curl -s -X POST http://127.0.0.1:8766/mcp -H 'Content-Type: application/json' \
-  -d '{"jsonrpc":"2.0","id":1,"method":"tools/call",
-       "params":{"name":"judge_master","arguments":{"path":"/abs/track.wav"}}}'
-```
+1. **The number** → `GATE` (a cap) or `PLATFORMS` / `REFERENCE_CURVE` (a target).
+2. **The judgement** → `MASTER_QUESTIONS` / `MIX_QUESTIONS` in the same file. `noul` only for
+   something that cannot be measured; `score` for magnitudes; `choice` for treatments.
+3. **The action** → `build_master_recipe` / `build_mix_recipe`, emitting `_action(...)`. Enforce the
+   cap in code; never trust the model to respect it.
 
 ## 6. The recipe contract
 
 Recipes are ordered arrays of `action` primitives; no plugin, vendor or DAW name appears.
-Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `1.1.0`).
+Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `2.0.0`).
 
 ```json
 [
-  {"action": "eq.high_pass", "target": "master", "schema": "1.1.0", "freq_hz": 25, "slope_db_oct": 12},
-  {"action": "eq.bell", "target": "master", "schema": "1.1.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"},
-  {"action": "limiter", "target": "master", "schema": "1.1.0", "ceiling_dbtp": -1.0, "expected_gain_reduction_db": 2.0},
-  {"action": "send_back", "target": "master", "schema": "1.1.0", "reasons": ["already_mastered:measured"], "probabilities": {"already_mastered": 0.77}}
+  {"action": "eq.high_pass", "target": "master", "schema": "2.0.0", "freq_hz": 25, "slope_db_oct": 12},
+  {"action": "eq.bell", "target": "master", "schema": "2.0.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"},
+  {"action": "limiter", "target": "master", "schema": "2.0.0", "ceiling_dbtp": -1.0, "expected_gain_reduction_db": 2.0},
+  {"action": "send_back", "target": "master", "schema": "2.0.0", "reasons": ["already_mastered:measured"]}
 ]
 ```
 
@@ -195,7 +187,7 @@ sensitivity to a known change, not agreement with a trained ear.
 
 ## 8. Status
 
-`0.1.0`. What is missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md): noise-floor and lossy-source
+`0.2.0` (rules 2.0.0). What is missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md): noise-floor and lossy-source
 detectors, reference-track analysis (the reference curve is still a constant), per-section analysis,
 `dry_run`, confidence policy, packaging and CI.
 

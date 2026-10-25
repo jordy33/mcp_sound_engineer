@@ -1,9 +1,9 @@
-# Recipe schema 1.1.0
+# Recipe schema 2.0.0
 
 A recipe is an ordered array of actions. Order matters: it is the signal chain.
 
 ```json
-{"action": "eq.bell", "target": "master", "schema": "1.1.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"}
+{"action": "eq.bell", "target": "master", "schema": "2.0.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"}
 ```
 
 ## Common fields
@@ -30,8 +30,8 @@ A recipe is an ordered array of actions. Order matters: it is the signal chain.
 | `limiter` | `ceiling_dbtp` ≤ −1.0, `expected_gain_reduction_db` ≤ 4, `target_lufs` |
 | `fader` | `target`, `gain_db` (mixing, ≤ ±3) |
 | `pan` | `target`, `position` −1..1 |
-| `dither` | `bit_depth` 16 or 24 |
-| `send_back` | `reasons` (array of attributable causes), `probabilities` (per gate) — terminal |
+| `dither` | `bit_depth` 16 or 24, `type` (`tpdf`) — only for fixed-bit destinations |
+| `send_back` | `reasons` (array of measured causes) — terminal |
 
 ## Adapter obligations
 

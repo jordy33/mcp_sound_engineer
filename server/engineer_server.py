@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """mcp_sound_engineer — MCP server (newline-delimited JSON-RPC 2.0 over stdio).
 
-Measures audio, asks Jev for typed decisions, returns an executable recipe
-for mcp_logic to apply inside Logic Pro.
+Measures audio, asks a decision model for typed answers, and returns an
+executable, DAW-neutral recipe. Applying it is another server's job.
 """
 from __future__ import annotations
 
@@ -16,60 +16,9 @@ import rules
 SERVER_NAME = "mcp_sound_engineer"
 SERVER_VERSION = "0.1.0"
 
-# --------------------------------------------------------------------------
-# Jev schemas
-# --------------------------------------------------------------------------
-MASTER_QUESTIONS = {
-    "needs_corrective": {"type": "noul",
-                         "instructions": "Does this need more than 3 dB of corrective EQ anywhere?"},
-    "phase_problem": {"type": "noul",
-                      "instructions": "Is phase correlation bad enough that elements vanish in mono?"},
-    "clipped": {"type": "noul",
-                "instructions": "Is there baked-in clipping or a lossy-source spectral cliff?"},
-    "already_mastered": {"type": "noul",
-                         "instructions": "Is this file already a finished master (loud, low LRA, "
-                                         "near zero true peak) rather than an unmastered mix?"},
-    "low_end": {"type": "score",
-                "instructions": "Low end vs reference_curve: how much low-mid/sub excess is there?",
-                "criteria": ["well balanced", "slight excess", "noticeable", "heavy", "extreme"]},
-    "high_mid": {"type": "score",
-                 "instructions": "2-6 kHz vs reference_curve: how much presence excess is there?",
-                 "criteria": ["none", "slight", "noticeable", "heavy", "extreme"]},
-    "sibilance": {"type": "choice",
-                  "instructions": "Which sibilance treatment fits, given the 5-9 kHz balance?",
-                  "criteria": {"none": "no treatment needed",
-                               "deess": "dynamic de-esser",
-                               "cut": "narrow static cut around 7 kHz"}},
-    "dynamics": {"type": "choice",
-                 "instructions": "Dynamics work needed? LRA < 4 LU or crest < 6 dB means already compressed.",
-                 "criteria": {"none": "already dense, do not compress",
-                              "glue": "gentle bus glue, 1-3 dB GR",
-                              "expand": "upward expansion to restore range"}},
-    "dynamics_amount": {"type": "score",
-                        "instructions": "If bus glue is used, how much gain reduction should it apply?",
-                        "criteria": ["0-1 dB", "1-1.5 dB", "1.5-2 dB", "2-2.5 dB", "2.5-3 dB"]},
-    "limiter": {"type": "score",
-                "instructions": "How much limiter gain reduction is appropriate to reach the target LUFS?",
-                "criteria": ["0-1 dB", "1-2 dB", "2-3 dB", "3-4 dB", "more than 4 dB"]},
-    "dither": {"type": "choice",
-               "instructions": "Output bit depth for this delivery",
-               "criteria": {"none_24": "24-bit, no dither", "tpdf_16": "16-bit with TPDF dither"}},
-}
-
-MIX_QUESTIONS = {
-    "balance": {"type": "choice",
-                "instructions": "Which element is out of balance in the stems?",
-                "criteria": {"balanced": "nothing is out of place",
-                             "vocal_forward": "vocal sits too high",
-                             "drums_forward": "drums dominate",
-                             "bass_heavy": "bass masks everything"}},
-    "masking": {"type": "score",
-                "instructions": "How much spectral masking is there between the stems?",
-                "criteria": ["none", "slight", "noticeable", "heavy", "extreme"]},
-    "bus_comp": {"type": "choice",
-                 "instructions": "Does the mix bus need glue compression?",
-                 "criteria": {"none": "no compression", "glue": "gentle bus glue"}},
-}
+# Jev schemas live in rules.py: one source of truth for the answer keys.
+MASTER_QUESTIONS = rules.MASTER_QUESTIONS
+MIX_QUESTIONS = rules.MIX_QUESTIONS
 
 
 # --------------------------------------------------------------------------
@@ -135,7 +84,7 @@ TOOLS = {
         "handler": lambda a: tool_analyze_stems(a["paths"]),
     },
     "judge_master": {
-        "description": "Typed mastering decisions via Jev plus an executable Logic Pro recipe. "
+        "description": "Typed mastering decisions plus an executable, DAW-neutral recipe. "
                        "Enforces the craft's hard caps (3 dB corrective, 3 dB GR, -1 dBTP).",
         "inputSchema": {"type": "object", "properties": {
             "path": {"type": "string"},
@@ -196,7 +145,7 @@ def handle(msg: dict) -> dict | None:
             text = json.dumps(payload, ensure_ascii=False, indent=1)
             return make_result(rid, {"content": [{"type": "text", "text": text}],
                                      "isError": False})
-        except (JevError, FileNotFoundError, ValueError, RuntimeError) as exc:
+        except Exception as exc:  # noqa: BLE001 — a bad file must not kill the server
             return make_result(rid, {"content": [{"type": "text", "text": f"error: {exc}"}],
                                      "isError": True})
     return make_error(rid, -32601, f"method not found: {method}")
