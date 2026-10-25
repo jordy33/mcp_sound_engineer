@@ -5,28 +5,34 @@ import argparse
 import json
 import sys
 
-from .calibration import Calibration
 from .logic_adapter import apply, plan, summary
+
+
+def _parse_targets(text: str) -> dict[str, dict]:
+    """`role=index:Track Name` pairs -> {role: {index, name}}."""
+    out: dict[str, dict] = {}
+    for pair in filter(None, (p.strip() for p in text.split(","))):
+        role, _, rest = pair.partition("=")
+        index, _, name = rest.partition(":")
+        out[role.strip()] = {"index": int(index), "name": name.strip()}
+    return out
 
 
 def main() -> int:
     parser = argparse.ArgumentParser(prog="adapter")
     parser.add_argument("--recipe", required=True, help="recipe JSON file")
-    parser.add_argument("--tracks", default="", help="role=index pairs, e.g. vocal=3,drums=1")
-    parser.add_argument("--master", type=int, default=None, help="track index used as the master")
+    parser.add_argument("--tracks", default="", help="role=index:Name, e.g. vocal=3:Lead Vocal")
+    parser.add_argument("--master", default="", help="index:Name of the master strip")
+    parser.add_argument("--project", required=True, help="absolute path to the .logicx package")
     parser.add_argument("--apply", action="store_true", help="execute the plan (default: dry run)")
     parser.add_argument("--endpoint", default="http://127.0.0.1:8765/mcp")
-    parser.add_argument("--calibration", default=None,
-                        help="Channel EQ calibration JSON (see calibration.example.json)")
     args = parser.parse_args()
 
     recipe = json.load(open(args.recipe))
-    tracks = {}
-    for pair in filter(None, args.tracks.split(",")):
-        role, _, index = pair.partition("=")
-        tracks[role.strip()] = int(index)
+    tracks = _parse_targets(args.tracks)
+    master = _parse_targets(args.master).get("master") if args.master else None
 
-    steps = plan(recipe, tracks, args.master, Calibration.load(args.calibration))
+    steps = plan(recipe, tracks, master, args.project)
     print(json.dumps({"dry_run": not args.apply, "summary": summary(steps), "steps": steps},
                      indent=1, ensure_ascii=False))
     if not args.apply:

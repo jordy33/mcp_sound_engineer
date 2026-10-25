@@ -12,8 +12,9 @@ those numbers, which means:
 * it cannot prefer one take over another;
 * it cannot be surprised. If the measurement does not capture a problem, the problem does not exist.
 
-Not implemented yet: denoise, dynamic EQ, tonal shelves. The adapter applies volume, pan and a
-compressor insert; EQ needs a calibration table and limiter/de-esser/dither are not insertable. Per-section analysis, reference-track deviation and the correlation drop after
+Not implemented yet: denoise, dynamic EQ, tonal shelves. The adapter applies volume, pan, Channel EQ in
+engineering units, compressor ratio/attack/release, the limiter ceiling and polarity; de-esser,
+dither and stereo imaging have no verified surface. Per-section analysis, reference-track deviation and the correlation drop after
 the chain **are** implemented (`analyze_sections`, `analyze_reference`, `judge_master.previous_path`).
 
 ## Measurement approximations

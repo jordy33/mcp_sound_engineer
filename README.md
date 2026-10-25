@@ -137,7 +137,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 80 assertions: smoke + rules + analysis + adapter
+./start-sound-engineer-mcp.sh --test     # 82 assertions: smoke + rules + analysis + adapter
 ```
 
 `tests/test_rules.py` asserts behaviour, not arithmetic:
@@ -180,38 +180,33 @@ Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `2.0.0`).
 
 ### Applying it: `adapter/`
 
-The recipe is DAW-neutral; `adapter/` translates it into `mcp_logic` tool calls and reports
-honestly what cannot be applied.
+The recipe is DAW-neutral; `adapter/` translates it into **verified** `mcp_logic` calls, read from
+its source: `logic_plugins.set_eq_band_verified`, `set_param_verified`, `insert_verified`, and
+`logic_mixer.set_volume/set_pan`.
 
 ```bash
-python -m adapter.cli --recipe recipe.json --tracks vocal=1,drums=2 --master 0        # dry run
-python -m adapter.cli --recipe recipe.json --tracks vocal=1 --master 0 --apply        # posts to :8765
+python -m adapter.cli --recipe recipe.json --project /path/Session.logicx \
+    --tracks "vocal=3:Lead Vocal,drums=1:Drums" --master "0:Stereo Out"   # dry run
+# add --apply to post to http://127.0.0.1:8765/mcp
 ```
 
-| Action | Status | What the adapter does |
+| Action | Status | Calls it emits |
 |---|---|---|
-| `fader` | **ready** | `logic_mixer.set_volume` with `dB → 0..1` (attenuation only); stems resolve by filename |
+| `fader` | **ready** | `logic_mixer.set_volume` (`dB → 0..1`, attenuation only) |
 | `pan` | **ready** | `logic_mixer.set_pan` |
-| `compressor` | **partial** | `insert_plugin … Compressor`; threshold is 0–100 and ratio/attack/release are not writable |
-| `eq.high_pass`, `eq.bell`, `eq.shelf`, `eq.high_pass_stem` | **needs_calibration** | with a calibration table they become `ready` (insert + one `set_plugin_param` per parameter) |
-| `limiter`, `de_esser`, `dither`, `stereo.width`, `dynamic_eq`, `polarity.invert` | **unsupported** | not insertable through the bridge; the step carries the manual instruction |
-| `send_back` | **terminal** | nothing is applied; the reasons are surfaced |
+| `eq.bell` | **ready** | `set_eq_band_verified` ×3: `Frequency`/`Hz`, `Gain`/`dB`, `Q-Factor`/`Q` |
+| `eq.high_pass`, `eq.high_pass_stem` | **ready** | `set_eq_band_verified` on `Low Cut`, `Frequency`/`Hz` (slope is a host popup → manual) |
+| `eq.shelf` | **ready** | `set_eq_band_verified` on `Low Shelf`/`High Shelf` |
+| `compressor` | **ready** | `insert_verified` + `set_param_verified` for `ratio`, `attack`, `release` |
+| `limiter` | **ready** | `insert_verified` + `set_param_verified` `outputCeiling`/`dB` |
+| `polarity.invert` | **ready** | `insert_verified` Gain + `set_param_verified` `phaseInvert` |
+| `de_esser`, `dither`, `stereo.width`, `dynamic_eq` | **unsupported** | not in the verified catalog; the step carries the manual instruction |
+| `send_back` | **terminal** | nothing is applied |
 
-| `masking`, `gain_staging` (deterministic faders toward −18 LUFS), `phase_before_eq`, `hpf_policy` | — | the mix half now decides with measurements, not only with the model |
-
-Every step is `ready`, `partial`, `unresolved` (no track index), `needs_calibration`, `unsupported`
-or `terminal`. **No step is ever silently dropped**, and `--apply` is off by default.
-
-Channel EQ calibration — `calibration.example.json` shows the shape; fill the curve points by
-sweeping one parameter and reading the host display, then:
-
-```bash
-python -m adapter.cli --recipe r.json --tracks "01_vocals.wav=1,02_drums.wav=2" \
-    --master 0 --calibration calibration.json
-```
-
-With a calibrated table an `eq.bell` becomes four calls: `insert_plugin` + three
-`set_plugin_param`. Without it, the step says `needs_calibration` instead of guessing.
+Every verified write carries `mode: duplicate_applyback` and `project_expected_path`;
+`insert_verified` also carries `expected_name` (a bare track index is refused by design).
+Compressor `threshold` is normalized 0–100 in that surface — **not dB** — so it is left manual.
+`--apply` is off by default and every call reports applied / error.
 
 ## 7. What has and has not been verified
 
@@ -235,8 +230,8 @@ sensitivity to a known change, not agreement with a trained ear.
 with CI on 3.9/3.11/3.12. What is still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
 
 * **denoise, dynamic EQ, tonal shelves** — vocabulary without an action;
-* **the adapter applies volume and pan, and can insert a compressor** — EQ needs a calibration sweep
-  (raw AX values) and limiter/de-esser/dither are not insertable at all;
+* **the adapter covers volume, pan, Channel EQ (Hz/dB/Q), compressor ratio/attack/release, the
+  limiter ceiling and polarity** — de-esser, dither and stereo imaging have no verified surface;
 * **the mix half is thin** — no gain staging, phase-before-EQ, HPF policy or panning;
 * **confidence policy** — answers below a threshold still produce a recipe instead of a refusal;
 * **no human-labelled evaluation** — sensitivity is measured, agreement with an engineer is not.
