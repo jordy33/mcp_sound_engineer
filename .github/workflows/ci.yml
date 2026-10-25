@@ -27,5 +27,7 @@ jobs:
         run: python tests/test_rules.py
       - name: analysis (known-answer signals)
         run: python tests/test_analysis.py
+      - name: adapter (plan against a fake session)
+        run: python tests/test_adapter.py
       - name: installable
         run: pip install -e . && python -c "import server.rules as r; print(r.RULES_VERSION)"

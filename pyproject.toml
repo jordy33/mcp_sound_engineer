@@ -13,4 +13,4 @@ exact = ["pyloudnorm>=0.1.1"]
 mcp-sound-engineer = "server.engineer_server:main"
 
 [tool.setuptools]
-packages = ["server"]
+packages = ["server", "adapter"]

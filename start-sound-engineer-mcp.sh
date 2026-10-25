@@ -44,7 +44,8 @@ case "${1:-}" in
   --test)  shift
            "$VENV/bin/python" tests/test_smoke.py "$@" || exit 1
            "$VENV/bin/python" tests/test_rules.py      || exit 1
-           exec "$VENV/bin/python" tests/test_analysis.py ;;
+           "$VENV/bin/python" tests/test_analysis.py   || exit 1
+           exec "$VENV/bin/python" tests/test_adapter.py ;;
 esac
 
 if [ ! -f .env ]; then

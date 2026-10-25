@@ -134,7 +134,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 65 assertions: smoke + rules + analysis
+./start-sound-engineer-mcp.sh --test     # 74 assertions: smoke + rules + analysis + adapter
 ```
 
 `tests/test_rules.py` asserts behaviour, not arithmetic:
@@ -175,6 +175,28 @@ Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `2.0.0`).
 ]
 ```
 
+### Applying it: `adapter/`
+
+The recipe is DAW-neutral; `adapter/` translates it into `mcp_logic` tool calls and reports
+honestly what cannot be applied.
+
+```bash
+python -m adapter.cli --recipe recipe.json --tracks vocal=1,drums=2 --master 0        # dry run
+python -m adapter.cli --recipe recipe.json --tracks vocal=1 --master 0 --apply        # posts to :8765
+```
+
+| Action | Status | What the adapter does |
+|---|---|---|
+| `fader` | **ready** | `logic_mixer.set_volume` with `dB → 0..1` (attenuation only; a boost cannot be expressed) |
+| `pan` | **ready** | `logic_mixer.set_pan` |
+| `compressor` | **partial** | `insert_plugin … Compressor`; threshold is 0–100 and ratio/attack/release are not writable |
+| `eq.high_pass`, `eq.bell`, `eq.shelf` | **needs_calibration** | parameters are raw AX values by index; a calibration sweep must map Hz/dB/Q first |
+| `limiter`, `de_esser`, `dither`, `stereo.width`, `dynamic_eq` | **unsupported** | not insertable through the bridge; the step carries the manual instruction |
+| `send_back` | **terminal** | nothing is applied; the reasons are surfaced |
+
+Every step is `ready`, `partial`, `unresolved` (no track index), `needs_calibration`, `unsupported`
+or `terminal`. **No step is ever silently dropped**, and `--apply` is off by default.
+
 ## 7. What has and has not been verified
 
 Measured on 24 real music clips (8 tracks × 3 versions: original, +3.4 dB at 60–250 Hz, +5.3 dB at
@@ -197,8 +219,8 @@ sensitivity to a known change, not agreement with a trained ear.
 with CI on 3.9/3.11/3.12. What is still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
 
 * **denoise, dynamic EQ, tonal shelves** — vocabulary without an action;
-* **no adapter** — nothing applies the recipe to a real session yet (fader is 0–1 in Logic, plugin
-  parameters are raw AX values);
+* **the adapter applies volume and pan, and can insert a compressor** — EQ needs a calibration sweep
+  (raw AX values) and limiter/de-esser/dither are not insertable at all;
 * **the mix half is thin** — no gain staging, phase-before-EQ, HPF policy or panning;
 * **confidence policy** — answers below a threshold still produce a recipe instead of a refusal;
 * **no human-labelled evaluation** — sensitivity is measured, agreement with an engineer is not.
