@@ -58,13 +58,21 @@ BAND_FOR_ROLE = {
 EQ_PARAMETER = {"freq": ("Frequency", "Hz"), "gain": ("Gain", "dB"), "q": ("Q-Factor", "Q")}
 
 
-def db_to_fader(db: float) -> float:
-    """Amplitude ratio clamped to the 0..1 the mixer accepts (attenuation only)."""
-    return round(max(0.0, min(1.0, 10 ** (float(db) / 20))), 4)
+def db_to_fader(db: float, calibration=None) -> float | None:
+    """dB -> mixer contract, via a measured calibration.
+
+    The mixer takes a contract value with a measured taper, not linear amplitude:
+    10**(dB/20) is wrong, and 1.0 is not necessarily 0 dB. Without at least three
+    measured points the adapter refuses to guess (returns None).
+    """
+    if calibration is None or not getattr(calibration, "complete", False):
+        return None
+    return calibration.to_contract(db)
 
 
 def plan(recipe: list[dict], tracks: dict[str, dict] | None = None,
-         master: dict | None = None, project_path: str | None = None) -> list[dict]:
+         master: dict | None = None, project_path: str | None = None,
+         fader_calibration=None) -> list[dict]:
     """Recipe -> ordered steps with explicit calls. No network, no session changes."""
     tracks = tracks or {}
     steps: list[dict] = []
@@ -91,7 +99,16 @@ def plan(recipe: list[dict], tracks: dict[str, dict] | None = None,
             continue
 
         if name in ("fader", "pan"):
-            steps.append(_mixer_step(step, name, action, target))
+            if name == "fader":
+                contract = db_to_fader(action.get("gain_db", 0.0), fader_calibration)
+                if contract is None:
+                    step["status"] = "needs_calibration"
+                    step["why"] = ("the mixer takes a contract value with a measured taper, not dB; "
+                                   "run adapter.calibrate_fader on a scratch track and pass "
+                                   "--fader-calibration")
+                    steps.append(step)
+                    continue
+            steps.append(_mixer_step(step, name, action, target, fader_calibration))
             continue
 
         if not project_path:
@@ -130,10 +147,12 @@ def _resolve_target(action: dict, tracks: dict, master: dict | None) -> dict | N
     return tracks.get(target)
 
 
-def _mixer_step(step: dict, name: str, action: dict, target: dict) -> dict:
+def _mixer_step(step: dict, name: str, action: dict, target: dict,
+                fader_calibration=None) -> dict:
     if name == "fader":
         command, params = "set_volume", {"track": target["index"],
-                                         "value": db_to_fader(action.get("gain_db", 0.0))}
+                                         "value": db_to_fader(action.get("gain_db", 0.0),
+                                                              fader_calibration)}
     else:
         command, params = "set_pan", {"track": target["index"],
                                       "value": float(action.get("position", 0.0))}

@@ -466,22 +466,101 @@ def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | N
 
 
 STEM_SYNONYMS = {
-    "vocal": ("vocal", "vox", "voice", "voz", "lead_vox", "ld"),
-    "drums": ("drum", "kick", "snare", "hat", "oh", "overhead", "perc", "loop", "beat", "kit"),
-    "bass": ("bass", "sub", "808", "kick_sub"),
+    "vocal": ("vocal", "vox", "voice", "voz"),
+    "drums": ("drum", "drums", "kick", "snare", "hat", "hats", "oh", "overhead",
+              "perc", "loop", "beat", "kit"),
+    "bass": ("bass", "808", "subbass", "sub_bass", "bassline"),
 }
+
+# Tokens that only ever belong to drums: a file named kick_sub.wav is a kick, not a bass.
+DRUM_EXCLUSIVE = {"kick", "snare", "hat", "hats", "oh", "overhead", "perc", "kit"}
 
 
 def _match_stem(stems: list[str], role: str) -> str | None:
-    """Match a role against the file's basename only, using explicit synonyms.
+    """Match a role against the basename, exact tokens first.
 
-    The old version searched the whole path: '/Bounces/Vocals_Session/02_drums.wav'
-    contains 'vocal' and was taken as the vocal.
+    - the path is never searched: '/Bounces/Vocals_Session/02_drums.wav' is drums
+    - drum-exclusive tokens never match bass or vocal: 'kick_sub' is a kick
+    - an exact token beats a substring, so 'bass_gtr' is not the bass if 'bass' exists
     """
     hints = STEM_SYNONYMS.get(role, (role,))
+    scored: list[tuple[int, str]] = []
     for path in stems or []:
         stem = os.path.splitext(os.path.basename(path))[0].lower()
-        tokens = re.split(r"[^a-z0-9]+", stem)
-        if any(h in tokens or h in stem for h in hints):
-            return path
-    return None
+        tokens = set(re.split(r"[^a-z0-9]+", stem))
+        if role != "drums" and tokens & DRUM_EXCLUSIVE:
+            continue
+        best = 0
+        for hint in hints:
+            if hint in tokens:
+                best = max(best, 3)
+            elif hint in stem:
+                best = max(best, 1)
+        if best:
+            scored.append((best, path))
+    if not scored:
+        return None
+    scored.sort(key=lambda item: -item[0])
+    return scored[0][1]
+def mix_warnings(answers: dict, stems: list[str]) -> list[str]:
+    """Say out loud when a decision cannot be applied to the exported files."""
+    out: list[str] = []
+    balance = _choice(answers, "balance")
+    role = {"vocal_too_high": "vocal", "drums_too_loud": "drums",
+            "bass_too_heavy": "bass"}.get(balance)
+    if role and not _match_stem(stems, role):
+        out.append(f"no exported stem matches {role!r}; the fader move was omitted "
+                   f"(stems: {[s.split('/')[-1] for s in stems]})")
+    return out
+
+
+def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | None = None) -> list[dict]:
+    """Mix decisions. PRODUCT DEFAULTS: not sourced from the mastering methodology."""
+    require(answers, MIX_QUESTIONS)
+    recipe: list[dict] = []
+
+    balance = _choice(answers, "balance")
+    # Every label names the problem, so every correction lowers the offender.
+    moves = {"vocal_too_high": ("vocal", -2.0), "drums_too_loud": ("drums", -2.0),
+             "bass_too_heavy": ("bass", -2.0)}
+    if balance in moves:
+        target, gain = moves[balance]
+        stem = _match_stem(stems, target)
+        if stem:
+            recipe.append(_action("fader", target=target, gain_db=clamp(gain, -3.0, 3.0),
+                                  stem=stem))
+    masking = _score(answers, "masking")
+    if masking >= 2.5:
+        recipe.append(_action("eq.bell", target="bus", freq_hz=300,
+                              gain_db=-clamp(masking - 2.0, 0.0, 3.0), q=4.0, role="corrective"))
+    # Gain staging is arithmetic, not taste: bring every stem toward -18 LUFS.
+    for stem in stem_facts or []:
+        lufs = float(stem.get("integrated_lufs", GAIN_STAGING_TARGET_LUFS))
+        move = clamp(GAIN_STAGING_TARGET_LUFS - lufs, -GAIN_STAGING_MAX_MOVE_DB,
+                     GAIN_STAGING_MAX_MOVE_DB)
+        if abs(move) >= 1.0:
+            recipe.append(_action("fader", target="stem", gain_db=round(move, 1),
+                                  stem=stem["path"], reason="gain_staging"))
+
+    # Phase before EQ: a cancelling stem gets polarity, not a filter.
+    if _choice(answers, "phase_before_eq") == "polarity":
+        for stem in stem_facts or []:
+            if float(stem.get("phase_correlation", 1.0)) < GATE["min_phase_correlation"]:
+                recipe.append(_action("polarity.invert", target="stem", stem=stem["path"],
+                                      reason="phase_correlation"))
+
+    # High-pass policy: everything that is not a low instrument.
+    if _choice(answers, "hpf_policy") == "all_but_kick_bass":
+        for stem in stem_facts or []:
+            if not stem.get("low_instrument", True):
+                recipe.append(_action("eq.high_pass_stem", target="stem", stem=stem["path"],
+                                      freq_hz=80, slope_db_oct=12))
+
+    for stem in stem_facts or []:
+        if float(stem.get("low_correlation", 1.0)) < GATE["min_phase_correlation"]:
+            recipe.append(_action("stereo.width", target="bus", mono_below_hz=120,
+                                  stem=stem["path"], reason="mono bass"))
+    if _choice(answers, "bus_comp") == "glue":
+        recipe.append(_action("compressor", target="mix_bus", ratio=2.0, attack_ms=30,
+                              release_ms=250, gain_reduction_db=2.0))
+    return recipe

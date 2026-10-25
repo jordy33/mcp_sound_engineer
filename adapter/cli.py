@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 
+from .fader_calibration import FaderCalibration
 from .logic_adapter import apply, plan, summary
 
 
@@ -26,13 +27,16 @@ def main() -> int:
     parser.add_argument("--project", required=True, help="absolute path to the .logicx package")
     parser.add_argument("--apply", action="store_true", help="execute the plan (default: dry run)")
     parser.add_argument("--endpoint", default="http://127.0.0.1:8765/mcp")
+    parser.add_argument("--fader-calibration", default=None,
+                        help="dB->contract points measured with adapter.calibrate_fader")
     args = parser.parse_args()
 
     recipe = json.load(open(args.recipe))
     tracks = _parse_targets(args.tracks)
     master = _parse_targets(args.master).get("master") if args.master else None
 
-    steps = plan(recipe, tracks, master, args.project)
+    steps = plan(recipe, tracks, master, args.project,
+                 FaderCalibration.load(args.fader_calibration))
     print(json.dumps({"dry_run": not args.apply, "summary": summary(steps), "steps": steps},
                      indent=1, ensure_ascii=False))
     if not args.apply:

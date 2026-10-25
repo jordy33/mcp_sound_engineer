@@ -7,8 +7,12 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "server"))
 
 import rules  # noqa: E402
-from adapter.logic_adapter import (CAPABILITIES, MODE, db_to_fader,  # noqa: E402
-                                   plan, summary)
+from adapter.fader_calibration import FaderCalibration  # noqa: E402
+from adapter.logic_adapter import (CAPABILITIES, MODE,  # noqa: E402
+                                   db_to_fader, plan, summary)
+from rules import _match_stem  # noqa: E402  (stem matching lives in the rules)
+
+FADER = FaderCalibration([[6, 1.0], [0, 0.8], [-6, 0.6], [-20, 0.4], [-60, 0.2]])
 
 PROJECT = "/tmp/session.logicx"
 MASTER = {"index": 0, "name": "Stereo Out"}
@@ -19,20 +23,26 @@ def test_every_action_has_a_capability():
     assert not missing, missing
 
 
-def test_db_to_fader_is_monotonic_and_clamped():
-    assert db_to_fader(0) == 1.0
-    assert abs(db_to_fader(-6) - 0.5012) < 0.001
-    assert db_to_fader(6) == 1.0          # a boost cannot be expressed as 0..1
-    assert db_to_fader(-80) >= 0.0
+def test_fader_without_calibration_refuses_to_guess():
+    assert db_to_fader(-6) is None
+    assert db_to_fader(-6, FaderCalibration([])) is None
 
 
-def test_fader_plan_uses_the_mixer_contract():
+def test_fader_needs_calibration_reported_explicitly():
     steps = plan([{"action": "fader", "target": "vocal", "gain_db": -2.0}],
                  {"vocal": {"index": 3, "name": "Lead Vocal"}})
+    assert steps[0]["status"] == "needs_calibration"
+    assert "calibrate_fader" in steps[0]["why"]
+
+
+def test_fader_uses_the_measured_taper():
+    steps = plan([{"action": "fader", "target": "vocal", "gain_db": -6.0}],
+                 {"vocal": {"index": 3, "name": "Lead Vocal"}},
+                 fader_calibration=FADER)
     assert steps[0]["status"] == "ready"
     assert steps[0]["calls"] == [{"tool": "logic_mixer",
                                   "arguments": {"command": "set_volume",
-                                                "params": {"track": 3, "value": 0.7943}}}]
+                                                "params": {"track": 3, "value": 0.6}}}]
 
 
 def test_eq_uses_engineering_units_not_raw_ax():
@@ -62,6 +72,12 @@ def test_compressor_writes_ratio_attack_release():
                  master=MASTER, project_path=PROJECT)
     params = [c["arguments"]["params"].get("param") for c in steps[0]["calls"]]
     assert params == [None, "ratio", "attack", "release"], params
+
+
+def test_stem_matching_never_mistakes_a_kick_for_a_bass():
+    assert _match_stem(["kick_sub.wav"], "bass") is None
+    assert _match_stem(["kick_sub.wav"], "drums") == "kick_sub.wav"
+    assert _match_stem(["sub_bass.wav"], "bass") == "sub_bass.wav"
 
 
 def test_polarity_uses_the_gain_plugin_phase_invert():
@@ -108,7 +124,7 @@ def test_summary_counts_calls():
 def test_unreachable_bridge_reports_an_error():
     from adapter.logic_adapter import apply
     steps = plan([{"action": "fader", "target": "vocal", "gain_db": -2.0}],
-                 {"vocal": {"index": 1, "name": "Vox"}})
+                 {"vocal": {"index": 1, "name": "Vox"}}, fader_calibration=FADER)
     results = apply(steps, endpoint="http://127.0.0.1:1/mcp", timeout=2)
     assert results and results[0]["status"] == "error"
 

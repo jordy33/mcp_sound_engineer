@@ -137,7 +137,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 82 assertions: smoke + rules + analysis + adapter
+./start-sound-engineer-mcp.sh --test     # 84 assertions: smoke + rules + analysis + adapter
 ```
 
 `tests/test_rules.py` asserts behaviour, not arithmetic:
@@ -192,7 +192,7 @@ python -m adapter.cli --recipe recipe.json --project /path/Session.logicx \
 
 | Action | Status | Calls it emits |
 |---|---|---|
-| `fader` | **ready** | `logic_mixer.set_volume` (`dB → 0..1`, attenuation only) |
+| `fader` | **needs_calibration** | `logic_mixer.set_volume` takes a contract 0..1 with a measured taper, **not dB**: run `python -m adapter.calibrate_fader --track N` on a scratch track, then pass `--fader-calibration` |
 | `pan` | **ready** | `logic_mixer.set_pan` |
 | `eq.bell` | **ready** | `set_eq_band_verified` ×3: `Frequency`/`Hz`, `Gain`/`dB`, `Q-Factor`/`Q` |
 | `eq.high_pass`, `eq.high_pass_stem` | **ready** | `set_eq_band_verified` on `Low Cut`, `Frequency`/`Hz` (slope is a host popup → manual) |
