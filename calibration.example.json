@@ -1,0 +1,12 @@
+{
+  "_comment": "Fill by sweeping one Channel EQ parameter at a time and reading the host display. curves: [musical_value, raw_ax_value]",
+  "channel_eq": {
+    "plugin_name": "Channel EQ",
+    "param_index": {"freq": 0, "gain": 1, "q": 2},
+    "curves": {
+      "freq": [[20, 0.0], [100, 0.25], [1000, 0.5], [10000, 0.75], [20000, 1.0]],
+      "gain": [[-24, 0.0], [-12, 0.25], [0, 0.5], [12, 0.75], [24, 1.0]],
+      "q": [[0.1, 0.0], [1.0, 0.25], [4.0, 0.5], [8.0, 0.7], [20.0, 1.0]]
+    }
+  }
+}

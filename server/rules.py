@@ -86,6 +86,8 @@ ACTIONS = {
     "dynamic_eq":    "frequency-selective dynamics",
     "de_esser":      "sibilance control",
     "stereo.width":  "stereo image (mono bass / width)",
+    "polarity.invert": "flip polarity (phase, before any EQ)",
+    "eq.high_pass_stem": "high-pass filter on one stem",
     "limiter":       "peak limiter",
     "fader":         "channel gain",
     "pan":           "stereo position",
@@ -131,7 +133,19 @@ MIX_QUESTIONS = {
     "bus_comp": {"type": "choice",
                  "instructions": "Does the mix bus need glue compression?",
                  "criteria": {"none": "no compression", "glue": "gentle bus glue"}},
+    "phase_before_eq": {"type": "choice",
+                        "instructions": "Given per-stem phase_correlation, is polarity the first fix?",
+                        "criteria": {"clean": "correlation is fine",
+                                     "polarity": "a stem cancels; flip polarity before EQ"}},
+    "hpf_policy": {"type": "choice",
+                   "instructions": "Should everything except kick and bass be high-passed?",
+                   "criteria": {"none": "no high-pass",
+                                "all_but_kick_bass": "high-pass vocals, guitars, keys, room mics"}},
 }
+
+GAIN_STAGING_TARGET_LUFS = -18.0
+GAIN_STAGING_MAX_MOVE_DB = 6.0
+CONFIDENCE_MIN = 0.5
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
@@ -379,6 +393,14 @@ def validate_recipe(recipe: list) -> list[dict]:
     return violations
 
 
+def confidence_report(answers: dict, threshold: float = CONFIDENCE_MIN) -> dict:
+    """Surface model answers that are close to a coin flip."""
+    low = {name: round(float(answer.get("confidence", 1.0)), 2)
+           for name, answer in answers.items()
+           if float(answer.get("confidence", 1.0)) < threshold}
+    return {"threshold": threshold, "low": low, "needs_human": bool(low)}
+
+
 def mix_warnings(answers: dict, stems: list[str]) -> list[str]:
     """Say out loud when a decision cannot be applied to the exported files."""
     out: list[str] = []
@@ -410,6 +432,29 @@ def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | N
     if masking >= 2.5:
         recipe.append(_action("eq.bell", target="bus", freq_hz=300,
                               gain_db=-clamp(masking - 2.0, 0.0, 3.0), q=4.0, role="corrective"))
+    # Gain staging is arithmetic, not taste: bring every stem toward -18 LUFS.
+    for stem in stem_facts or []:
+        lufs = float(stem.get("integrated_lufs", GAIN_STAGING_TARGET_LUFS))
+        move = clamp(GAIN_STAGING_TARGET_LUFS - lufs, -GAIN_STAGING_MAX_MOVE_DB,
+                     GAIN_STAGING_MAX_MOVE_DB)
+        if abs(move) >= 1.0:
+            recipe.append(_action("fader", target="stem", gain_db=round(move, 1),
+                                  stem=stem["path"], reason="gain_staging"))
+
+    # Phase before EQ: a cancelling stem gets polarity, not a filter.
+    if _choice(answers, "phase_before_eq") == "polarity":
+        for stem in stem_facts or []:
+            if float(stem.get("phase_correlation", 1.0)) < GATE["min_phase_correlation"]:
+                recipe.append(_action("polarity.invert", target="stem", stem=stem["path"],
+                                      reason="phase_correlation"))
+
+    # High-pass policy: everything that is not a low instrument.
+    if _choice(answers, "hpf_policy") == "all_but_kick_bass":
+        for stem in stem_facts or []:
+            if not stem.get("low_instrument", True):
+                recipe.append(_action("eq.high_pass_stem", target="stem", stem=stem["path"],
+                                      freq_hz=80, slope_db_oct=12))
+
     for stem in stem_facts or []:
         if float(stem.get("low_correlation", 1.0)) < GATE["min_phase_correlation"]:
             recipe.append(_action("stereo.width", target="bus", mono_below_hz=120,

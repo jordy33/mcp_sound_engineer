@@ -8,6 +8,15 @@ sys.path.insert(0, os.path.join(ROOT, "server"))
 import rules  # noqa: E402
 
 
+def _mix_answers(**over):
+    base = {k: {"type": v["type"], "noul": 0.1, "score": 0.0,
+                "choice": next(iter(v.get("criteria", {"none": ""})))}
+            for k, v in rules.MIX_QUESTIONS.items()}
+    for k, v in over.items():
+        base[k].update(v)
+    return base
+
+
 def _answers(**over):
     base = {k: {"type": v["type"],
                 "noul": 0.1, "score": 0.0,
@@ -94,11 +103,11 @@ def test_lossy_source_gate():
 
 
 def test_mix_warns_when_no_stem_matches():
-    answers = {"balance": {"choice": "vocal_too_high"}, "masking": {"score": 0.0},
-               "bus_comp": {"choice": "none"}}
-    warnings = rules.mix_warnings(answers, ["mixdown.wav"])
+    warnings = rules.mix_warnings(_mix_answers(balance={"choice": "vocal_too_high"}),
+                                  ["mixdown.wav"])
     assert warnings and "vocal" in warnings[0], warnings
-    assert rules.mix_warnings(answers, ["01_vocals.wav"]) == []
+    assert rules.mix_warnings(_mix_answers(balance={"choice": "vocal_too_high"}),
+                              ["01_vocals.wav"]) == []
 
 
 def test_unmastered_mix_is_not_sent_back():
@@ -177,24 +186,21 @@ def test_gain_reduction_respects_the_source_range():
 # --- mix half ---------------------------------------------------------------
 def test_every_balance_label_lowers_the_culprit():
     for label in ("vocal_too_high", "drums_too_loud", "bass_too_heavy"):
-        answers = {"balance": {"choice": label}, "masking": {"score": 0.0},
-                   "bus_comp": {"choice": "none"}}
-        recipe = rules.build_mix_recipe(answers, ["vocals.wav", "drums.wav", "bass.wav"])
+        answers = _mix_answers(balance={"choice": label})
+        recipe = rules.build_mix_recipe(answers, ["01_vocals.wav", "02_drums.wav", "03_bass.wav"])
         faders = [a for a in recipe if a["action"] == "fader"]
         assert faders and all(a["gain_db"] < 0 for a in faders), (label, recipe)
 
 
 def test_fader_points_at_a_real_stem():
-    answers = {"balance": {"choice": "vocal_too_high"}, "masking": {"score": 0.0},
-               "bus_comp": {"choice": "none"}}
-    recipe = rules.build_mix_recipe(answers, ["01_vocals.wav", "02_drums.wav"])
+    recipe = rules.build_mix_recipe(_mix_answers(balance={"choice": "vocal_too_high"}),
+                                    ["01_vocals.wav", "02_drums.wav"])
     assert recipe and recipe[0]["stem"] == "01_vocals.wav", recipe
 
 
 def test_no_stem_match_means_no_invented_fader():
-    answers = {"balance": {"choice": "vocal_too_high"}, "masking": {"score": 0.0},
-               "bus_comp": {"choice": "none"}}
-    assert rules.build_mix_recipe(answers, ["mixdown.wav"]) == []
+    assert rules.build_mix_recipe(_mix_answers(balance={"choice": "vocal_too_high"}),
+                                  ["mixdown.wav"]) == []
 
 
 # --- contract ---------------------------------------------------------------
@@ -311,6 +317,46 @@ def test_mono_compatibility_warning():
                                                                "true_peak_dbtp": -1.2}}
     warnings = rules.loudness_warnings(facts, rules.PLATFORMS["spotify"])
     assert any("mono fold-down" in w for w in warnings), warnings
+
+
+def test_gain_staging_moves_each_stem_toward_minus_18():
+    stems = [{"path": "/s/01_vocals.wav", "integrated_lufs": -12.0, "low_correlation": 1.0,
+              "low_instrument": False, "phase_correlation": 0.9},
+             {"path": "/s/02_bass.wav", "integrated_lufs": -28.0, "low_correlation": 1.0,
+              "low_instrument": True, "phase_correlation": 0.9}]
+    recipe = rules.build_mix_recipe(_mix_answers(), [s["path"] for s in stems], stems)
+    moves = {a["stem"]: a["gain_db"] for a in recipe if a.get("reason") == "gain_staging"}
+    assert moves["/s/01_vocals.wav"] == -6.0, moves
+    assert moves["/s/02_bass.wav"] == 6.0, moves
+
+
+def test_polarity_comes_before_eq_for_a_cancelling_stem():
+    stems = [{"path": "/s/01_vocals.wav", "integrated_lufs": -18.0, "low_correlation": 1.0,
+              "low_instrument": False, "phase_correlation": -0.4}]
+    recipe = rules.build_mix_recipe(
+        _mix_answers(phase_before_eq={"choice": "polarity"}, hpf_policy={"choice": "all_but_kick_bass"}),
+        [s["path"] for s in stems], stems)
+    order = [a["action"] for a in recipe]
+    assert "polarity.invert" in order and "eq.high_pass_stem" in order, order
+    assert order.index("polarity.invert") < order.index("eq.high_pass_stem"), order
+
+
+def test_hpf_skips_low_instruments():
+    stems = [{"path": "/s/01_vocals.wav", "integrated_lufs": -18.0, "low_correlation": 1.0,
+              "low_instrument": False, "phase_correlation": 0.9},
+             {"path": "/s/02_bass.wav", "integrated_lufs": -18.0, "low_correlation": 1.0,
+              "low_instrument": True, "phase_correlation": 0.9}]
+    recipe = rules.build_mix_recipe(_mix_answers(hpf_policy={"choice": "all_but_kick_bass"}),
+                                    [s["path"] for s in stems], stems)
+    hpf = [a for a in recipe if a["action"] == "eq.high_pass_stem"]
+    assert [a["stem"] for a in hpf] == ["/s/01_vocals.wav"], hpf
+
+
+def test_confidence_report_flags_coin_flips():
+    report = rules.confidence_report({"a": {"score": 1.0, "confidence": 0.2},
+                                      "b": {"score": 2.0, "confidence": 0.9}})
+    assert report["needs_human"] is True and report["low"] == {"a": 0.2}
+    assert rules.confidence_report({"a": {"score": 1.0, "confidence": 0.8}})["needs_human"] is False
 
 
 def test_action_rejects_unknown_target():

@@ -115,6 +115,9 @@ one source of truth for both the numbers and the answer keys.
 | Cumulative corrective EQ | ≤ 6 dB | `GATE.max_cumulative_corrective_db` | includes the sibilance cut |
 | Total gain reduction | ≤ 6 dB (source range 6–8) | `GATE.max_total_gain_reduction_db` | compressor + limiter summing over budget → `send_back` |
 | Mono compatibility | fold-down loss < 6 dB | `GATE.min_mono_cancel_db` | warning with the measured loss |
+| Gain staging (mix) | every stem toward −18 LUFS | `GAIN_STAGING_*` | deterministic faders, ±6 dB max |
+| Phase before EQ (mix) | correlation < +0.3 | `phase_before_eq` | `polarity.invert` or `eq.high_pass_stem` |
+| Confidence | < 0.5 | `CONFIDENCE_MIN` | `confidence.needs_human` + warning; the recipe is a draft |
 | Broadband compression | 1.5–3:1, 10–30 ms, 1–3 dB GR | `CHAIN`, `GATE.min/max_gain_reduction_db` | emitted on the master bus |
 | De-esser | after compression | `CHAIN` | emitted after the compressor |
 | Limiter | ceiling from the destination, GR computed | `expected_limiter_gr` | arithmetic from measured LUFS, not a model score |
@@ -134,7 +137,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 74 assertions: smoke + rules + analysis + adapter
+./start-sound-engineer-mcp.sh --test     # 80 assertions: smoke + rules + analysis + adapter
 ```
 
 `tests/test_rules.py` asserts behaviour, not arithmetic:
@@ -187,15 +190,28 @@ python -m adapter.cli --recipe recipe.json --tracks vocal=1 --master 0 --apply  
 
 | Action | Status | What the adapter does |
 |---|---|---|
-| `fader` | **ready** | `logic_mixer.set_volume` with `dB → 0..1` (attenuation only; a boost cannot be expressed) |
+| `fader` | **ready** | `logic_mixer.set_volume` with `dB → 0..1` (attenuation only); stems resolve by filename |
 | `pan` | **ready** | `logic_mixer.set_pan` |
 | `compressor` | **partial** | `insert_plugin … Compressor`; threshold is 0–100 and ratio/attack/release are not writable |
-| `eq.high_pass`, `eq.bell`, `eq.shelf` | **needs_calibration** | parameters are raw AX values by index; a calibration sweep must map Hz/dB/Q first |
-| `limiter`, `de_esser`, `dither`, `stereo.width`, `dynamic_eq` | **unsupported** | not insertable through the bridge; the step carries the manual instruction |
+| `eq.high_pass`, `eq.bell`, `eq.shelf`, `eq.high_pass_stem` | **needs_calibration** | with a calibration table they become `ready` (insert + one `set_plugin_param` per parameter) |
+| `limiter`, `de_esser`, `dither`, `stereo.width`, `dynamic_eq`, `polarity.invert` | **unsupported** | not insertable through the bridge; the step carries the manual instruction |
 | `send_back` | **terminal** | nothing is applied; the reasons are surfaced |
+
+| `masking`, `gain_staging` (deterministic faders toward −18 LUFS), `phase_before_eq`, `hpf_policy` | — | the mix half now decides with measurements, not only with the model |
 
 Every step is `ready`, `partial`, `unresolved` (no track index), `needs_calibration`, `unsupported`
 or `terminal`. **No step is ever silently dropped**, and `--apply` is off by default.
+
+Channel EQ calibration — `calibration.example.json` shows the shape; fill the curve points by
+sweeping one parameter and reading the host display, then:
+
+```bash
+python -m adapter.cli --recipe r.json --tracks "01_vocals.wav=1,02_drums.wav=2" \
+    --master 0 --calibration calibration.json
+```
+
+With a calibrated table an `eq.bell` becomes four calls: `insert_plugin` + three
+`set_plugin_param`. Without it, the step says `needs_calibration` instead of guessing.
 
 ## 7. What has and has not been verified
 

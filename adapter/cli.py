@@ -5,6 +5,7 @@ import argparse
 import json
 import sys
 
+from .calibration import Calibration
 from .logic_adapter import apply, plan, summary
 
 
@@ -15,6 +16,8 @@ def main() -> int:
     parser.add_argument("--master", type=int, default=None, help="track index used as the master")
     parser.add_argument("--apply", action="store_true", help="execute the plan (default: dry run)")
     parser.add_argument("--endpoint", default="http://127.0.0.1:8765/mcp")
+    parser.add_argument("--calibration", default=None,
+                        help="Channel EQ calibration JSON (see calibration.example.json)")
     args = parser.parse_args()
 
     recipe = json.load(open(args.recipe))
@@ -23,7 +26,7 @@ def main() -> int:
         role, _, index = pair.partition("=")
         tracks[role.strip()] = int(index)
 
-    steps = plan(recipe, tracks, args.master)
+    steps = plan(recipe, tracks, args.master, Calibration.load(args.calibration))
     print(json.dumps({"dry_run": not args.apply, "summary": summary(steps), "steps": steps},
                      indent=1, ensure_ascii=False))
     if not args.apply:

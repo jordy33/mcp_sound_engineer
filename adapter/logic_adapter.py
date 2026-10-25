@@ -9,8 +9,11 @@ report says why.
 from __future__ import annotations
 
 import json
+import os
 import urllib.error
 import urllib.request
+
+from .calibration import Calibration
 
 # Default conversion, to be replaced by a calibration run per session.
 # Logic's AX fader is 0..1 normalized; 1.0 = unity for a track fader is an
@@ -25,6 +28,8 @@ CAPABILITIES = {
     "eq.bell":        "needs_calibration",
     "eq.shelf":       "needs_calibration",
     "stereo.width":   "unsupported",
+    "polarity.invert": "unsupported",
+    "eq.high_pass_stem": "needs_calibration",
     "de_esser":       "unsupported",
     "limiter":        "unsupported",
     "dither":         "unsupported",
@@ -38,6 +43,7 @@ MANUAL_HINT = {
     "dither": "set the bounce bit depth; Logic dithers on export",
     "stereo.width": "insert a Stereo Spread / Direction Mixer and mono below 120 Hz",
     "dynamic_eq": "insert a multipressor or dynamic EQ by hand",
+    "polarity.invert": "no bridge tool for polarity; flip the track's phase by hand",
 }
 
 
@@ -47,7 +53,8 @@ def db_to_fader(db: float) -> float:
 
 
 def plan(recipe: list[dict], tracks: dict[str, int] | None = None,
-         master_track: int | None = None) -> list[dict]:
+         master_track: int | None = None,
+         calibration: Calibration | None = None) -> list[dict]:
     """Recipe -> ordered steps. No network, no session changes."""
     tracks = tracks or {}
     steps: list[dict] = []
@@ -67,8 +74,13 @@ def plan(recipe: list[dict], tracks: dict[str, int] | None = None,
             continue
 
         if capability == "needs_calibration":
-            step["why"] = ("Logic exposes plugin parameters as raw AX values by index; "
-                           "run the calibration sweep to map frequency/gain/Q")
+            calls = _eq_calls(action, tracks, master_track, calibration)
+            if calls:
+                step["status"] = "ready"
+                step["calls"] = calls
+            else:
+                step["why"] = ("Logic exposes plugin parameters as raw AX values by index; "
+                               "load a calibration table (see calibration.example.json)")
             steps.append(step)
             continue
 
@@ -76,35 +88,69 @@ def plan(recipe: list[dict], tracks: dict[str, int] | None = None,
         if track is None:
             step["status"] = "unresolved"
             step["why"] = (f"no track index for target {action.get('target')!r}; "
-                           f"pass --tracks <role>=<index>")
+                           f"pass --tracks <role>=<index> (or <file>.wav=<index> for stems)")
             steps.append(step)
             continue
 
         if name == "fader":
-            step["tool"] = "logic_mixer"
-            step["arguments"] = {"command": "set_volume",
-                                 "params": {"track": track,
-                                            "value": db_to_fader(action.get("gain_db", 0.0))}}
+            step["calls"] = [{"tool": "logic_mixer",
+                              "arguments": {"command": "set_volume",
+                                            "params": {"track": track,
+                                                       "value": db_to_fader(action.get("gain_db", 0.0))}}}]
         elif name == "pan":
-            step["tool"] = "logic_mixer"
-            step["arguments"] = {"command": "set_pan",
-                                 "params": {"track": track,
-                                            "value": float(action.get("position", 0.0))}}
+            step["calls"] = [{"tool": "logic_mixer",
+                              "arguments": {"command": "set_pan",
+                                            "params": {"track": track,
+                                                       "value": float(action.get("position", 0.0))}}}]
         elif name == "compressor":
-            step["tool"] = "logic_mixer"
-            step["arguments"] = {"command": "insert_plugin",
-                                 "params": {"track": track, "slot": 0,
-                                            "plugin_name": "Compressor", "confirmed": True}}
+            step["calls"] = [{"tool": "logic_mixer",
+                              "arguments": {"command": "insert_plugin",
+                                            "params": {"track": track, "slot": 0,
+                                                       "plugin_name": "Compressor",
+                                                       "confirmed": True}}}]
             step["then"] = ("threshold is 0..100 and ratio/attack/release are not writable "
                             "through the bridge; set them by hand")
         steps.append(step)
     return steps
 
 
+def _eq_calls(action: dict, tracks: dict, master_track: int | None,
+              calibration: Calibration | None) -> list[dict]:
+    """A calibrated EQ action becomes insert + one set_plugin_param per parameter."""
+    if calibration is None or not calibration.covers(["freq", "gain", "q"]):
+        return []
+    track = _resolve_track(action, tracks, master_track)
+    if track is None:
+        return []
+    freq = float(action.get("freq_hz", 1000.0))
+    gain = float(action.get("gain_db", 0.0))
+    q = float(action.get("q", 1.0))
+    calls = [{"tool": "logic_mixer",
+              "arguments": {"command": "insert_plugin",
+                            "params": {"track": track, "slot": 0,
+                                       "plugin_name": calibration.plugin.get("plugin_name",
+                                                                             "Channel EQ"),
+                                       "confirmed": True}}}]
+    for name, value in (("freq", freq), ("gain", gain), ("q", q)):
+        raw = calibration.to_raw(name, value)
+        calls.append({"tool": "logic_mixer",
+                      "arguments": {"command": "set_plugin_param",
+                                    "params": {"track": track, "insert": 0,
+                                               "param": calibration.param_index(name),
+                                               "value": raw}}})
+    return calls
+
+
 def _resolve_track(action: dict, tracks: dict[str, int], master_track: int | None) -> int | None:
     target = (action.get("target") or "master").lower()
     if target in ("master", "mix_bus", "bus"):
         return master_track
+    if target == "stem":
+        stem = action.get("stem")
+        if not stem:
+            return None
+        base = os.path.basename(stem)
+        return tracks.get(base) or tracks.get(os.path.splitext(base)[0]) or tracks.get(stem)
     return tracks.get(target)
 
 
@@ -116,28 +162,35 @@ def summary(steps: list[dict]) -> dict:
             "ready": sum(1 for s in steps if s["status"] in ("ready", "partial"))}
 
 
-def apply(steps: list[dict], endpoint: str = "http://127.0.0.1:8765/mcp", timeout: int = 30) -> list[dict]:
-    """Execute only the steps that carry a tool call, reporting every outcome."""
-    results = []
+def apply(steps: list[dict], endpoint: str = "http://127.0.0.1:8765/mcp",
+          timeout: int = 30) -> list[dict]:
+    """Execute only the steps that carry calls, reporting every outcome."""
+    results: list[dict] = []
     for index, step in enumerate(steps):
-        if "tool" not in step:
+        if not step.get("calls"):
             results.append({"index": index, "action": step["action"],
                             "status": step["status"], "skipped": True})
             continue
-        body = {"jsonrpc": "2.0", "id": index + 1, "method": "tools/call",
-                "params": {"name": step["tool"], "arguments": step["arguments"]}}
-        request = urllib.request.Request(
-            endpoint, data=json.dumps(body).encode(),
-            headers={"Content-Type": "application/json",
-                     "Accept": "application/json, text/event-stream"})
-        try:
-            with urllib.request.urlopen(request, timeout=timeout) as response:
-                payload = json.loads(response.read())
-            result = payload.get("result", {})
-            results.append({"index": index, "action": step["action"],
-                            "status": "error" if result.get("isError") else "applied",
-                            "detail": result.get("content", [{}])[0].get("text", "")[:200]})
-        except (urllib.error.URLError, TimeoutError) as exc:
-            results.append({"index": index, "action": step["action"],
-                            "status": "error", "detail": str(exc)[:200]})
+        for n, call in enumerate(step["calls"]):
+            results.append(_post(index, step, call, n, endpoint, timeout))
     return results
+
+
+def _post(index: int, step: dict, call: dict, n: int,
+          endpoint: str, timeout: int) -> dict:
+    body = {"jsonrpc": "2.0", "id": index * 100 + n, "method": "tools/call",
+            "params": {"name": call["tool"], "arguments": call["arguments"]}}
+    request = urllib.request.Request(
+        endpoint, data=json.dumps(body).encode(),
+        headers={"Content-Type": "application/json",
+                 "Accept": "application/json, text/event-stream"})
+    try:
+        with urllib.request.urlopen(request, timeout=timeout) as response:
+            payload = json.loads(response.read())
+        result = payload.get("result", {})
+        return {"index": index, "action": step["action"], "call": n,
+                "status": "error" if result.get("isError") else "applied",
+                "detail": result.get("content", [{}])[0].get("text", "")[:200]}
+    except (urllib.error.URLError, TimeoutError, OSError) as exc:
+        return {"index": index, "action": step["action"], "call": n,
+                "status": "error", "detail": str(exc)[:200]}

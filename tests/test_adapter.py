@@ -27,9 +27,9 @@ def test_db_to_fader_is_monotonic_and_clamped():
 def test_fader_plan_targets_a_track():
     steps = plan([{"action": "fader", "target": "vocal", "gain_db": -2.0}], {"vocal": 3})
     assert steps[0]["status"] == "ready"
-    assert steps[0]["tool"] == "logic_mixer"
-    assert steps[0]["arguments"] == {"command": "set_volume",
-                                     "params": {"track": 3, "value": 0.7943}}
+    assert steps[0]["calls"] == [{"tool": "logic_mixer",
+                                  "arguments": {"command": "set_volume",
+                                                "params": {"track": 3, "value": 0.7943}}}]
 
 
 def test_unmapped_role_is_unresolved_not_guessed():
@@ -71,6 +71,27 @@ def test_plan_never_mutates_the_recipe():
     before = [dict(action) for action in recipe]
     plan(recipe, {"vocal": 1})
     assert recipe == before
+
+
+def test_calibration_makes_eq_appliable():
+    from adapter.calibration import Calibration
+    cal = Calibration({"channel_eq": {"plugin_name": "Channel EQ",
+                                      "param_index": {"freq": 0, "gain": 1, "q": 2},
+                                      "curves": {"freq": [[20, 0.0], [20000, 1.0]],
+                                                 "gain": [[-24, 0.0], [24, 1.0]],
+                                                 "q": [[0.1, 0.0], [20.0, 1.0]]}}})
+    steps = plan([{"action": "eq.bell", "target": "master", "freq_hz": 300,
+                   "gain_db": -2.0, "q": 4.0}], master_track=0, calibration=cal)
+    assert steps[0]["status"] == "ready"
+    assert [c["arguments"]["command"] for c in steps[0]["calls"]] == [
+        "insert_plugin", "set_plugin_param", "set_plugin_param", "set_plugin_param"]
+
+
+def test_unreachable_bridge_reports_an_error_instead_of_raising():
+    from adapter.logic_adapter import apply
+    steps = plan([{"action": "fader", "target": "vocal", "gain_db": -2.0}], {"vocal": 1})
+    results = apply(steps, endpoint="http://127.0.0.1:1/mcp", timeout=2)
+    assert results and results[0]["status"] == "error", results
 
 
 if __name__ == "__main__":

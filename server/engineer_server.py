@@ -81,6 +81,9 @@ def tool_judge_master(path: str, platform: str = "spotify",
     }
     answers = ask(state, MASTER_QUESTIONS)
     warnings = rules.loudness_warnings(facts, target)
+    confidence = rules.confidence_report(answers)
+    if confidence["needs_human"]:
+        warnings.append(f"low confidence on {sorted(confidence['low'])}; treat the recipe as a draft")
     if previous_path:
         drop = rules.correlation_drop(analyze_master(previous_path), facts)
         if drop["exceeds"]:
@@ -90,6 +93,7 @@ def tool_judge_master(path: str, platform: str = "spotify",
             "recipe": rules.build_master_recipe(answers, facts, platform),
             "target": target,
             "reference": measured,
+            "confidence": confidence,
             "warnings": warnings}
 
 
@@ -98,10 +102,14 @@ def tool_judge_mix(paths: list[str]) -> dict:
     state = {"context": {"stage": "mixing"}, "facts": facts, "limits": rules.GATE}
     answers = ask(state, MIX_QUESTIONS)
     names = [s["path"] for s in facts["stems"]]
+    confidence = rules.confidence_report(answers)
     warnings = rules.mix_warnings(answers, names)
+    if confidence["needs_human"]:
+        warnings.append(f"low confidence on {sorted(confidence['low'])}; treat the recipe as a draft")
     warnings += [f"{g['gate']}: {g}" for g in facts.get("gates", [])]
     return {"facts": facts, "answers": answers,
             "recipe": rules.build_mix_recipe(answers, names, facts["stems"]),
+            "confidence": confidence,
             "warnings": warnings}
 
 
