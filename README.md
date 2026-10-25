@@ -113,7 +113,7 @@ schemas in [`server/engineer_server.py`](server/engineer_server.py).
 | Broadband compression | 1.5–3:1, 10–30 ms, ≤ 3 dB GR | `CHAIN`, `GATE.max_gain_reduction_db` | ⚠️ recipe emits ratio/attack; GR comes from `dynamics_amount` |
 | Limiter | ceiling −1.0 dBTP, ≤ 4 dB GR | `PLATFORMS`, `GATE.max_limiter_gr_db` | ✅ |
 | Dither last | always | `CHAIN` | ✅ last action |
-| Loudness targets | Spotify −14, Apple −16, … | `PLATFORMS` | ✅ |
+| Playback normalization vs delivery ceiling | Spotify −14 LUFS *reference*, ceiling −1 dBTP; CD 16-bit + dither | `PLATFORMS`, `loudness_warnings` | ✅ reference is informational, ceiling is enforced |
 | Noise floor | > −50 dB → send back | `GATE.noise_floor_*` | ❌ no detector yet |
 | Lossy source | cliff > 20 dB above HF shelf | `GATE.lossy_shelf_drop_db` | ❌ no detector yet |
 | Ten-stage chain order | HPF → … → dither | `CHAIN` | ⚠️ documented, not enforced as a pipeline |
@@ -121,6 +121,27 @@ schemas in [`server/engineer_server.py`](server/engineer_server.py).
 
 The ❌ rows are honest gaps: the constant exists, the detector does not. They are listed in
 [`docs/LIMITS.md`](docs/LIMITS.md) and in §8.
+
+### How to know a rule is real
+
+Claims in this README are worth nothing; the tests are the contract.
+
+```bash
+./start-sound-engineer-mcp.sh --test     # smoke + 12 domain assertions
+```
+
+`tests/test_rules.py` encodes the domain, not the implementation:
+
+* streaming loudness is a **playback reference** — no `target_lufs` may exist anywhere;
+* CD is 16-bit + TPDF, streaming is 24-bit + no dither;
+* corrective EQ never exceeds 3 dB per point and 6 dB total;
+* gain reduction never exceeds 3 dB, limiter never exceeds 4 dB;
+* `send_back` is terminal; an unmastered mix is never refused;
+* every `GATE` constant is either enforced or listed in `UNIMPLEMENTED_GATES` — a rule cannot be
+  documented but unwired without failing the suite.
+
+When you change a rule, break it on purpose first: reintroduce the wrong value and confirm the suite
+goes red. If it stays green, the test is decoration.
 
 ### Adding a rule
 
@@ -151,7 +172,7 @@ Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `1.1.0`).
 [
   {"action": "eq.high_pass", "target": "master", "schema": "1.1.0", "freq_hz": 25, "slope_db_oct": 12},
   {"action": "eq.bell", "target": "master", "schema": "1.1.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"},
-  {"action": "limiter", "target": "master", "schema": "1.1.0", "ceiling_dbtp": -1.0, "target_lufs": -14.0},
+  {"action": "limiter", "target": "master", "schema": "1.1.0", "ceiling_dbtp": -1.0, "expected_gain_reduction_db": 2.0},
   {"action": "send_back", "target": "master", "schema": "1.1.0", "reasons": ["already_mastered:measured"], "probabilities": {"already_mastered": 0.77}}
 ]
 ```

@@ -38,15 +38,26 @@ CHAIN = [
 ]
 
 # --- Loudness targets per platform ------------------------------------------
+# Streaming services NORMALIZE playback loudness. The numbers below are playback
+# references, NOT delivery targets: one master with true peak under the ceiling serves
+# all of them, and a quieter master is not a worse master. Only physical/broadcast
+# destinations need a separate pass (bit depth, dither, ceiling).
 PLATFORMS = {
-    "spotify":     {"lufs": -14.0, "true_peak": -1.0},
-    "apple_music": {"lufs": -16.0, "true_peak": -1.0},
-    "youtube":     {"lufs": -14.0, "true_peak": -1.0},
-    "amazon":      {"lufs": -14.0, "true_peak": -2.0},
-    "tidal":       {"lufs": -14.0, "true_peak": -1.0},
-    "cd":          {"lufs": -9.0,  "true_peak": -0.1},
-    "podcast":     {"lufs": -16.0, "true_peak": -1.0},
+    "spotify":     {"normalization_lufs": -14.0, "true_peak_ceiling": -1.0, "bit_depth": 24, "dither": "none"},
+    "apple_music": {"normalization_lufs": -16.0, "true_peak_ceiling": -1.0, "bit_depth": 24, "dither": "none"},
+    "youtube":     {"normalization_lufs": -14.0, "true_peak_ceiling": -1.0, "bit_depth": 24, "dither": "none"},
+    "amazon":      {"normalization_lufs": -14.0, "true_peak_ceiling": -2.0, "bit_depth": 24, "dither": "none"},
+    "tidal":       {"normalization_lufs": -14.0, "true_peak_ceiling": -1.0, "bit_depth": 24, "dither": "none"},
+    "cd":          {"normalization_lufs": None,  "true_peak_ceiling": -0.1, "bit_depth": 16, "dither": "tpdf"},
+    "podcast":     {"normalization_lufs": -16.0, "true_peak_ceiling": -1.0, "bit_depth": 16, "dither": "tpdf"},
 }
+
+# Which GATE constants are actually enforced by code (tests assert this set is complete).
+IMPLEMENTED_GATES = {
+    "max_corrective_db_per_point", "max_cumulative_corrective_db",
+    "min_phase_correlation", "max_limiter_gr_db", "max_gain_reduction_db",
+}
+UNIMPLEMENTED_GATES = {"noise_floor_moderate_db", "noise_floor_minor_db", "lossy_shelf_drop_db"}
 
 # --- Reference curve (dB relative to total energy), for deviation math ------
 REFERENCE_CURVE = {
@@ -136,6 +147,22 @@ def _action(action: str, target: str = "master", **params) -> dict:
             "schema": RECIPE_SCHEMA_VERSION, **params}
 
 
+def loudness_warnings(facts: dict, target: dict) -> list[str]:
+    """Human-facing notes: what the platform will do to this master."""
+    out: list[str] = []
+    loud = facts.get("loudness") or {}
+    lufs = float(loud.get("integrated_lufs", -99.0))
+    tp = float(loud.get("true_peak_dbtp", -99.0))
+    ceiling = target["true_peak_ceiling"]
+    if tp > ceiling:
+        out.append(f"true peak {tp} dBTP is above the {ceiling} dBTP ceiling for this destination")
+    ref = target.get("normalization_lufs")
+    if ref is not None and lufs > ref + 6:
+        out.append(f"{round(lufs - ref, 1)} dB hotter than the {ref} LUFS playback reference — "
+                   f"the service will turn it down, so those extra dB buy nothing and cost dynamics")
+    return out
+
+
 def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -> list[dict]:
     """Typed answers -> DAW-neutral action plan, clipped by the craft's caps."""
     recipe: list[dict] = []
@@ -176,15 +203,16 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
     dyn = choice("dynamics")
     if dyn == "glue":
         recipe.append(_action("compressor", target="mix_bus", ratio=2.0, attack_ms=20, release_ms=200,
-                              gain_reduction_db=clamp(0.5 + 0.5 * score("dynamics_amount"), 0.5, 3.0)))
+                              gain_reduction_db=clamp(0.5 + 0.5 * score("dynamics_amount"), 0.5,
+                                                      GATE["max_gain_reduction_db"])))
     elif dyn == "expand":
         recipe.append(_action("compressor", target="mix_bus", mode="upward_expand",
                               reason="restore range on over-compressed material"))
 
-    recipe.append(_action("limiter", ceiling_dbtp=target["true_peak"],
-                          expected_gain_reduction_db=round(clamp(score("limiter"), 0.0, GATE["max_limiter_gr_db"]), 1),
-                          target_lufs=target["lufs"]))
-    recipe.append(_action("dither", bit_depth=16 if choice("dither") == "tpdf_16" else 24))
+    recipe.append(_action("limiter", ceiling_dbtp=target["true_peak_ceiling"],
+                          expected_gain_reduction_db=round(clamp(score("limiter"), 0.0, GATE["max_limiter_gr_db"]), 1)))
+    bit_depth = 16 if choice("dither") == "tpdf_16" else target["bit_depth"]
+    recipe.append(_action("dither", bit_depth=bit_depth))
     return recipe
 
 

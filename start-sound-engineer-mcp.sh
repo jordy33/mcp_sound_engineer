@@ -41,7 +41,9 @@ case "${1:-}" in
   --restart)
     if is_running; then kill "$(cat "$PIDFILE")" 2>/dev/null; sleep 1; rm -f "$PIDFILE"; fi
     shift || true ;;
-  --test)  shift; exec "$VENV/bin/python" tests/test_smoke.py "$@" ;;
+  --test)  shift
+           "$VENV/bin/python" tests/test_smoke.py "$@" || exit 1
+           exec "$VENV/bin/python" tests/test_rules.py ;;
 esac
 
 if [ ! -f .env ]; then

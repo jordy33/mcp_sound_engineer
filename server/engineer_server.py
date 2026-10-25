@@ -88,7 +88,10 @@ def tool_judge_master(path: str, platform: str = "spotify") -> dict:
     target = rules.loudness_target(platform)
     state = {
         "context": {"stage": "mastering", "platform": platform,
-                    "target_lufs": target["lufs"], "target_true_peak": target["true_peak"]},
+                    "playback_normalization_lufs": target["normalization_lufs"],
+                    "delivery_true_peak_ceiling": target["true_peak_ceiling"],
+                    "note": "streaming loudness is normalized on playback; the master is not "
+                            "required to reach the normalization figure"},
         "facts": facts,
         "reference_curve": rules.REFERENCE_CURVE,
         "limits": rules.GATE,
@@ -96,7 +99,8 @@ def tool_judge_master(path: str, platform: str = "spotify") -> dict:
     answers = ask(state, MASTER_QUESTIONS)
     return {"facts": facts, "answers": answers,
             "recipe": rules.build_master_recipe(answers, facts, platform),
-            "target": target}
+            "target": target,
+            "warnings": rules.loudness_warnings(facts, target)}
 
 
 def tool_judge_mix(paths: list[str]) -> dict:
