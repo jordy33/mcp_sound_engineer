@@ -20,9 +20,15 @@ SERVER_VERSION = "0.1.0"
 # Jev schemas
 # --------------------------------------------------------------------------
 MASTER_QUESTIONS = {
-    "send_back": {"type": "noul",
-                  "instructions": "Does this mix need more than 3 dB of corrective EQ, or does it "
-                                  "have phase/clipping/lossy-source problems that mastering cannot fix?"},
+    "needs_corrective": {"type": "noul",
+                         "instructions": "Does this need more than 3 dB of corrective EQ anywhere?"},
+    "phase_problem": {"type": "noul",
+                      "instructions": "Is phase correlation bad enough that elements vanish in mono?"},
+    "clipped": {"type": "noul",
+                "instructions": "Is there baked-in clipping or a lossy-source spectral cliff?"},
+    "already_mastered": {"type": "noul",
+                         "instructions": "Is this file already a finished master (loud, low LRA, "
+                                         "near zero true peak) rather than an unmastered mix?"},
     "low_end": {"type": "score",
                 "instructions": "Low end vs reference_curve: how much low-mid/sub excess is there?",
                 "criteria": ["well balanced", "slight excess", "noticeable", "heavy", "extreme"]},
@@ -189,7 +195,55 @@ def handle(msg: dict) -> dict | None:
     return make_error(rid, -32601, f"method not found: {method}")
 
 
+def serve_http(port: int = 8766) -> None:
+    """Optional transport, mirroring the usual MCP bridge shape: POST /mcp + GET /health."""
+    from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
+
+    class Handler(BaseHTTPRequestHandler):
+        def _send(self, code: int, obj: dict) -> None:
+            body = json.dumps(obj, ensure_ascii=False).encode()
+            self.send_response(code)
+            self.send_header("Content-Type", "application/json")
+            self.send_header("Content-Length", str(len(body)))
+            self.end_headers()
+            self.wfile.write(body)
+
+        def do_GET(self):  # noqa: N802
+            if self.path == "/health":
+                self._send(200, {"status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION})
+            else:
+                self._send(200, {"server": SERVER_NAME, "mcp": "POST /mcp", "health": "/health"})
+
+        def do_POST(self):  # noqa: N802
+            if self.path not in ("/mcp", "/"):
+                return self._send(404, {"error": "not found"})
+            length = int(self.headers.get("Content-Length") or 0)
+            try:
+                msg = json.loads(self.rfile.read(length) or b"{}")
+            except json.JSONDecodeError:
+                return self._send(400, make_error(None, -32700, "parse error"))
+            reply = handle(msg)
+            if reply is None:
+                return self._send(202, {"status": "accepted"})
+            self._send(200, reply)
+
+        def log_message(self, *args):  # silence per-request logging
+            pass
+
+    srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    print(f"[engineer] listening on http://127.0.0.1:{port}", flush=True)
+    print("[engineer]   MCP JSON-RPC : POST /mcp", flush=True)
+    print("[engineer]   health       : GET /health", flush=True)
+    srv.serve_forever()
+
+
 def main() -> None:
+    if "--http" in sys.argv:
+        port = 8766
+        if "--port" in sys.argv:
+            port = int(sys.argv[sys.argv.index("--port") + 1])
+        serve_http(port)
+        return
     for line in sys.stdin:
         line = line.strip()
         if not line:

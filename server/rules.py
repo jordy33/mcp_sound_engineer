@@ -9,7 +9,7 @@ Sources: mastering-engineer methodology (fadelabs/phantom) + 2026 platform targe
 from __future__ import annotations
 
 RULES_VERSION = "1.0.0"
-RECIPE_SCHEMA_VERSION = "1.0.0"
+RECIPE_SCHEMA_VERSION = "1.1.0"
 
 # --- Gates: when to refuse to master a mix -----------------------------------
 GATE = {
@@ -83,6 +83,50 @@ def loudness_target(platform: str) -> dict:
     return PLATFORMS.get(platform.lower(), PLATFORMS["spotify"])
 
 
+GATE_QUESTIONS = ("needs_corrective", "phase_problem", "clipped", "already_mastered")
+GATE_THRESHOLD = 0.8          # model alone must be quite sure
+MIN_CLIPPED_SAMPLES = 500     # a handful of overs is inaudible, not a send-back
+MIN_CLIPPED_PROPORTION = 0.0001
+MAX_LRA_FINISHED = 4.0        # LRA < 4 LU = already over-compressed
+
+
+def evaluate_gates(answers: dict, facts: dict) -> dict:
+    """Decide whether to refuse mastering, and say exactly why.
+
+    Two layers: the model's calibrated answers, plus deterministic guards that do not
+    depend on the model being right.
+    """
+    reasons: list[str] = []
+    probabilities: dict[str, float] = {}
+    for name in GATE_QUESTIONS:
+        prob = float(answers.get(name, {}).get("noul", 0.0))
+        probabilities[name] = round(prob, 2)
+        if prob >= GATE_THRESHOLD:
+            reasons.append(name)
+
+    stereo = facts.get("stereo") or {}
+    if float(stereo.get("phase_correlation", 1.0)) < GATE["min_phase_correlation"]:
+        if "phase_problem" not in reasons:
+            reasons.append("phase_problem:measured")
+
+    loud = facts.get("loudness") or {}
+    clipping = facts.get("clipping") or {}
+    clipped_samples = int(clipping.get("count", 0))
+    frames = float(facts.get("duration_seconds", 0)) * float(facts.get("sample_rate", 1)) or 1.0
+    proportion = clipped_samples / frames
+    if (clipped_samples >= MIN_CLIPPED_SAMPLES or proportion >= MIN_CLIPPED_PROPORTION) \
+            and "clipped" not in reasons:
+        reasons.append("clipped:measured")
+
+    if (float(loud.get("loudness_range_lu", 99)) < MAX_LRA_FINISHED
+            and float(loud.get("true_peak_dbtp", -99)) > -1.0
+            and float(loud.get("integrated_lufs", -99)) > -12.0
+            and "already_mastered" not in reasons):
+        reasons.append("already_mastered:measured")
+
+    return {"send_back": bool(reasons), "reasons": reasons, "probabilities": probabilities}
+
+
 def _action(action: str, target: str = "master", **params) -> dict:
     if action not in ACTIONS:
         raise ValueError(f"unknown action: {action}")
@@ -106,9 +150,10 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
     def choice(name: str, default: str = "") -> str:
         return str(answers.get(name, {}).get("choice", default))
 
-    if noul("send_back") >= 0.7:
-        return [_action("send_back", reason="corrective EQ or phase problems outside mastering scope",
-                        confidence=round(noul("send_back"), 2))]
+    gates = evaluate_gates(answers, facts)
+    if gates["send_back"]:
+        return [_action("send_back", reasons=gates["reasons"],
+                        probabilities=gates["probabilities"])]
 
     recipe.append(_action("eq.high_pass", freq_hz=25, slope_db_oct=12, reason="sub-bass cleanup"))
 
