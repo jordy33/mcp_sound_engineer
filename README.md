@@ -1,76 +1,127 @@
 # mcp_sound_engineer
 
-The **ears and the judgement** of an AI sound engineer, as an [MCP](https://modelcontextprotocol.io) server.
+An MCP server that **measures audio and decides like a mix/master engineer** — and returns a
+DAW-neutral action plan.
 
-It measures audio, decides like a mix/master engineer, and returns an **executable recipe** that
-[`mcp_logic`](https://github.com/jordy33/mcp_logic) applies inside Logic Pro.
+It does not control any DAW, and it never will. It is one of two separate MCPs:
 
 ```
-        ┌──────────────────────────┐        ┌─────────────────────┐        ┌──────────────┐
- audio  │  mcp_sound_engineer      │ typed  │  agent / LLM        │  tool  │  mcp_logic   │
-───────►│  measure → judge → recipe│───────►│  (plans the session)│───────►│  (Logic Pro) │
-        └──────────────────────────┘        └─────────────────────┘        └──────────────┘
-              numpy + rules                    Jev (typed decisions)
+┌───────────────────────┐   facts + answers + recipe   ┌──────────────────────┐
+│  mcp_sound_engineer   │ ───────────────────────────► │  adapter MCP (any)   │
+│  measure → judge      │        (neutral JSON)        │  mcp_logic · reaper  │
+└───────────────────────┘                              └──────────────────────┘
+        numpy + Jev                                         applies the plan
 ```
 
-Two hats, one server:
+Keeping them apart means the same judgement layer works with Logic, REAPER, Ableton, Pro Tools,
+or a plain CLI — the adapter is replaceable, the engineer is not.
 
-* **Mixing engineer** — takes the recorded tracks (vocals, instruments, drums), balances levels,
-  cleans imperfections, applies EQ/compression/reverb so they coexist.
-* **Mastering engineer** — final step: polishes and unifies the sound for streaming, radio or cinema.
+## Two hats, one server
 
-## Why typed decisions
+| Role | Input | What it decides |
+|---|---|---|
+| **Mixing engineer** | N recorded stems | balance, masking, corrective EQ, bus glue, fader moves |
+| **Mastering engineer** | one stereo file | send-back gates, corrective/tonal EQ, dynamics, limiter, loudness target, dither |
 
-The judge is [Jev](https://jevtypesafeai.com), a *System One* decision model: it does not write prose,
-it returns `choice` / `score` / `noul` answers with calibrated probabilities. So the output of this
-server is machine-actionable — no parsing, no hallucinated plugin names, no "sounds a bit muddy".
+## Why typed decisions (and why Jev)
 
-The professional rules live in [`server/rules.py`](server/rules.py) and are enforced as hard caps:
-a decision can never exceed the limits of the craft (>3 dB corrective EQ, 3 dB gain reduction, etc.).
+A generative model writes prose; this server needs a decision a program can act on. The judge is
+[Jev](https://jevtypesafeai.com), a *System One* model trained for calibrated decisions (RLCD):
+it answers `choice` / `score` / `noul` with probabilities and cannot emit an invalid label.
+
+Measured evidence, 24 real music clips, 8 tracks × 3 versions (original, +3.4 dB at 60–250 Hz,
++5.3 dB at 6–16 kHz):
+
+| Task | Jev | Gemini 3.8 Flash (audio) |
+|---|---|---|
+| Detect +5.3 dB of added highs | **8/8**, mean +22.4 pts | 4/8, mean +6.1 pts |
+| Detect +3.4 dB of added lows | **5/8**, mean +5.4 pts | 3/8, mean −1.6 pts |
+| Spearman(measured tilt, "bright") | **+0.77** | +0.24 |
+| Spearman(measured tilt, "muddy") | −0.49 | **+0.42 (inverted)** |
+| Stability across runs | ±1 pt | ±17 pts between tracks |
+
+The audio model hears a 16 kHz mono clip with no reference; the decision model gets the measurement
+and the reference curve. For *measuring*, feeding the measurement wins. (Both are far from a human
+engineer — see `docs/LIMITS.md`.)
 
 ## Tools
 
 | Tool | Input | Returns |
 |---|---|---|
-| `analyze_master` | one stereo file | LUFS, true peak, LRA, crest, phase correlation, 6 bands, clipping |
+| `analyze_master` | one stereo file | LUFS, true peak, LRA, crest, phase correlation, 6 bands, centroid, clipping |
 | `analyze_stems` | N files | per-stem loudness + bands, pairwise masking matrix |
-| `judge_master` | path (+ target platform) | `answers` (typed) + `recipe` for Logic |
+| `judge_master` | path + platform | `answers` (typed) + `recipe` (neutral actions) |
 | `judge_mix` | stem paths | `answers` + `recipe` (faders, EQ, bus compression) |
-| `engineer_info` | — | rules version, model, configured targets |
+| `engineer_info` | — | rules version, Jev config, platforms |
+
+## The recipe contract
+
+Recipes are arrays of actions. No plugin, vendor or DAW name ever appears:
+
+```json
+[
+  {"action": "eq.high_pass", "target": "master", "schema": "1.0.0", "freq_hz": 25, "slope_db_oct": 12},
+  {"action": "eq.bell",      "target": "master", "schema": "1.0.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"},
+  {"action": "de_esser",     "target": "master", "schema": "1.0.0", "freq_hz": 6500, "ratio": 2.0},
+  {"action": "compressor",   "target": "mix_bus","schema": "1.0.0", "ratio": 2.0, "attack_ms": 20, "release_ms": 200, "gain_reduction_db": 0.5},
+  {"action": "limiter",      "target": "master", "schema": "1.0.0", "ceiling_dbtp": -1.0, "expected_gain_reduction_db": 1.2, "target_lufs": -14.0},
+  {"action": "dither",       "target": "master", "schema": "1.0.0", "bit_depth": 16}
+]
+```
+
+Full schema: [`docs/RECIPE.md`](docs/RECIPE.md). An adapter maps `eq.bell` → Channel EQ band (Logic),
+ReaEQ (REAPER), EQ3 (Pro Tools). It must reject anything outside the caps and report back what it
+actually applied.
 
 ## The rules
 
-Sourced from professional mastering methodology
-([mastering-engineer skill](https://github.com/fadelabs/phantom/blob/main/plugin/skills/mastering-engineer/SKILL.md),
-[mastering guide 2026](https://www.masteringthemix.com/pages/audio-mastering-guide)):
+Professional mastering methodology, enforced as hard caps
+([mastering-engineer](https://github.com/fadelabs/phantom/blob/main/plugin/skills/mastering-engineer/SKILL.md),
+[mastering guide 2026](https://www.masteringthemix.com/pages/audio-mastering-guide)).
 
-| Gate | Threshold |
+**Gates — when to send the mix back instead of mastering it:**
+
+| Condition | Threshold |
 |---|---|
-| Send back: corrective EQ at one point | > 3 dB |
-| Send back: cumulative corrective EQ | > 6 dB |
-| Send back: phase correlation | < +0.3 |
-| Send back: noise floor | > −50 dB (moderate) |
-| Send back: lossy source | drop > 20 dB above the HF shelf |
-| True peak ceiling | −1.0 dBTP |
-| Broadband compression | 1.5–3:1, attack 10–30 ms, GR ≤ 3 dB |
-| Corrective EQ Q | 4–8 |
-| Loudness targets | Spotify −14, Apple Music −16, YouTube −14, CD −9…−14 |
+| Corrective EQ at a single point | > 3 dB |
+| Cumulative corrective EQ | > 6 dB |
+| Phase correlation | < +0.3 (elements vanish in mono) |
+| Noise floor | > −50 dB |
+| Lossy source | drop > 20 dB above the HF shelf |
+| Baked-in clipping | any |
+
+**The ten stages, in order:** high-pass 20–30 Hz (6–12 dB/oct) → corrective EQ (Q 4–8, ≤3 dB) →
+denoise (tonal → clicks → broadband) → broadband compression (1.5–3:1, 10–30 ms attack, ≤3 dB GR) →
+dynamic EQ → tonal EQ (Q 0.5–1.5) → stereo (mono <120 Hz) → limiter (−1.0 dBTP, ≤4 dB GR) →
+loudness target → dither last.
+
+**Loudness targets:** Spotify −14, Apple Music −16, YouTube −14, Amazon −14/−2 dBTP, Tidal −14,
+CD −9/−0.1, podcast −16.
+
+## Measurement notes
+
+* `integrated_lufs` uses `pyloudnorm` when installed; otherwise a K-weighting + RMS approximation.
+* `true_peak_dbtp` is 4× oversampled via FFT zero-padding (BS.1770 minimum), not 8×.
+* `loudness_range_lu` is EBU-style short-term P95−P10, indicative not certified.
+* `phase_correlation` is Pearson between L/R over the whole file — it does not localize problems.
+* WAV via stdlib; FLAC/OGG/AIFF need `soundfile`.
 
 ## Install
 
 ```bash
 python3 -m venv .venv && source .venv/bin/activate
 pip install -r requirements.txt
-cp .env.example .env          # add your JEV_API_KEY
+cp .env.example .env          # add JEV_API_KEY
+python tests/test_smoke.py
 ```
 
 ## Run
 
 ```bash
-python server/engineer_server.py        # newline-delimited JSON-RPC 2.0 on stdin/stdout
+python server/engineer_server.py    # newline-delimited JSON-RPC 2.0 on stdin/stdout
 ```
 
-Register next to `mcp_logic`:
+Register it next to whichever adapter you use — they are independent servers:
 
 ```json
 {
@@ -81,29 +132,23 @@ Register next to `mcp_logic`:
 }
 ```
 
-## Example
-
-```json
-{"tool": "judge_master", "arguments": {"path": "/renders/take-3.wav", "platform": "spotify"}}
-```
-
-```json
-{
-  "facts":  {"loudness": {"integrated_lufs": -11.2, "true_peak_dbtp": 0.4}, "spectral": {...}},
-  "answers": {
-    "send_back": {"type": "noul", "noul": 0.12},
-    "low_end":   {"type": "score", "score": 3.4, "confidence": 0.71},
-    "limiter":   {"type": "score", "score": 1.2, "confidence": 0.66}
-  },
-  "recipe": [
-    {"plugin": "Channel EQ", "type": "high_pass", "freq_hz": 25, "slope_db_oct": 12},
-    {"plugin": "Channel EQ", "type": "bell_cut", "freq_hz": 300, "gain_db": -2.0, "q": 5.0},
-    {"plugin": "Limiter", "ceiling_dbtp": -1.0, "target_lufs": -14.0}
-  ]
-}
-```
-
 ## Status
 
-Early. The measurement layer and the rules are real; the Jev schemas are the first version.
-`mcp_logic` exposes the execution side.
+`0.1.0`. Measurement layer and rules are real and tested; Jev schemas are version 1.
+See [`docs/LIMITS.md`](docs/LIMITS.md) for what this does **not** do, and the roadmap below.
+
+### Roadmap (what's missing)
+
+1. **Detectors that the gates already reference but are not implemented**: noise floor, lossy
+   source, baked-in clipping beyond a sample counter, phase-vs-frequency.
+2. **Reference analysis** — measure a commercial reference and compute real per-band deviation.
+   This is ~70 % of mastering practice and today the reference curve is a constant.
+3. **Per-section analysis** (verse/chorus) instead of whole-file numbers.
+4. **Better masking metric** for stems (band-wise overlap weighted by level, not an average).
+5. **Recipe application report** from adapters + a `dry_run` mode.
+6. **Confidence policy**: refuse to act below a threshold instead of always answering.
+7. Packaging (`pyproject.toml`), CI, versioned schema migrations, fixture audio.
+
+## License
+
+MIT.
