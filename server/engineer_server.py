@@ -231,9 +231,17 @@ def serve_http(port: int = 8766) -> None:
             pass
 
     srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
+    cfg = config()
     print(f"[engineer] listening on http://127.0.0.1:{port}", flush=True)
     print("[engineer]   MCP JSON-RPC : POST /mcp", flush=True)
     print("[engineer]   health       : GET /health", flush=True)
+    print(f"[engineer]   rules        : {rules.RULES_VERSION}  schema {rules.RECIPE_SCHEMA_VERSION}", flush=True)
+    print(f"[engineer]   tools        : {', '.join(TOOLS)}", flush=True)
+    if cfg["key"]:
+        print(f"[engineer]   jev          : configured ({cfg['model']})", flush=True)
+    else:
+        print("[engineer]   jev          : NOT configured — put JEV_API_KEY in .env "
+              "(analyze_* still work)", flush=True)
     srv.serve_forever()
 
 

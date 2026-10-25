@@ -24,14 +24,17 @@ if [ "$WANT" != "$HAVE" ]; then
   echo "$WANT" > "$STAMP"
 fi
 
+case "${1:-}" in
+  --test)  shift; exec "$VENV/bin/python" tests/test_smoke.py "$@" ;;
+esac
+
 if [ ! -f .env ]; then
   cp .env.example .env
   echo "[engineer] .env created — put your JEV_API_KEY in it, then run again"
-  exit 1
 fi
 
 case "${1:-}" in
-  --test)  shift; exec "$VENV/bin/python" tests/test_smoke.py "$@" ;;
+  --stdio) shift; exec "$VENV/bin/python" server/engineer_server.py "$@" ;;
   --http)  shift; exec "$VENV/bin/python" server/engineer_server.py --http "$@" ;;
-  *)       exec "$VENV/bin/python" server/engineer_server.py "$@" ;;
+  *)       exec "$VENV/bin/python" server/engineer_server.py --http "$@" ;;
 esac
