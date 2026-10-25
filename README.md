@@ -117,8 +117,8 @@ one source of truth for both the numbers and the answer keys.
 | Playback normalization | Spotify −14, Apple −16, … | `PLATFORMS` | informational; never a delivery target |
 | Unknown destination | — | `loudness_target` | raises, no silent fallback |
 | Reference curve | normalized so the six bands sum to 0 dB | `REFERENCE_CURVE` | linear sum = 1.0 |
-| Noise floor | > −50 dB | `GATE.noise_floor_*` | ❌ no detector |
-| Lossy source | cliff > 20 dB | `GATE.lossy_shelf_drop_db` | ❌ no detector |
+| Noise floor | > −50 dB | `GATE.noise_floor_moderate_db` | **measured in silence only**; `None` when the file has no gap |
+| Lossy source | cliff > 20 dB between 14–16 k and 16–18 k | `GATE.lossy_shelf_drop_db` | **measured** → `send_back` |
 | `eq.shelf`, `dynamic_eq`, `stereo.width`, `pan` | vocabulary only | `ACTIONS` | ❌ never emitted |
 
 **The decision model never gates.** It scores and chooses treatments; every refusal is measured.
@@ -128,7 +128,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 36 assertions: smoke + rules + analysis
+./start-sound-engineer-mcp.sh --test     # 42 assertions: smoke + rules + analysis
 ```
 
 `tests/test_rules.py` asserts behaviour, not arithmetic:

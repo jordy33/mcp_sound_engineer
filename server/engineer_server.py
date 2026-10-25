@@ -56,8 +56,10 @@ def tool_judge_mix(paths: list[str]) -> dict:
     facts = analyze_stems(paths)
     state = {"context": {"stage": "mixing"}, "facts": facts, "limits": rules.GATE}
     answers = ask(state, MIX_QUESTIONS)
+    names = [s["path"] for s in facts["stems"]]
     return {"facts": facts, "answers": answers,
-            "recipe": rules.build_mix_recipe(answers, [s["name"] for s in facts["stems"]])}
+            "recipe": rules.build_mix_recipe(answers, names),
+            "warnings": rules.mix_warnings(answers, names)}
 
 
 def tool_engineer_info() -> dict:

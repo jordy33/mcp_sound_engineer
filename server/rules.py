@@ -33,9 +33,9 @@ GATE = {
 IMPLEMENTED_GATES = {
     "max_corrective_db_per_point", "max_cumulative_corrective_db",
     "min_phase_correlation", "max_limiter_gr_db", "max_gain_reduction_db",
-    "min_gain_reduction_db",
+    "min_gain_reduction_db", "noise_floor_moderate_db", "lossy_shelf_drop_db",
 }
-UNIMPLEMENTED_GATES = {"noise_floor_moderate_db", "noise_floor_minor_db", "lossy_shelf_drop_db"}
+UNIMPLEMENTED_GATES = {"noise_floor_minor_db"}
 
 # --- The ten stages, in order ------------------------------------------------
 CHAIN = [
@@ -194,6 +194,15 @@ def evaluate_gates(facts: dict) -> dict:
     if clipped >= MIN_CLIPPED_SAMPLES and (clipped / frames) >= MIN_CLIPPED_PROPORTION:
         reasons.append("clipped:measured")
 
+    noise = facts.get("noise") or {}
+    floor = noise.get("floor_dbfs")
+    if floor is not None and float(floor) > GATE["noise_floor_moderate_db"]:
+        reasons.append("noise_floor:measured")
+
+    bandwidth = facts.get("bandwidth") or {}
+    if bandwidth.get("lossy_suspected"):
+        reasons.append("lossy_source:measured")
+
     # PRODUCT RULE (not in the source): a finished master cannot be mastered again.
     if (float(loud.get("loudness_range_lu", 99)) < MAX_LRA_FINISHED
             and float(loud.get("true_peak_dbtp", -99)) > -1.0
@@ -282,6 +291,18 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
     if target["dither"] != "none":
         recipe.append(_action("dither", bit_depth=target["bit_depth"], type=target["dither"]))
     return recipe
+
+
+def mix_warnings(answers: dict, stems: list[str]) -> list[str]:
+    """Say out loud when a decision cannot be applied to the exported files."""
+    out: list[str] = []
+    balance = _choice(answers, "balance")
+    role = {"vocal_too_high": "vocal", "drums_too_loud": "drums",
+            "bass_too_heavy": "bass"}.get(balance)
+    if role and not _match_stem(stems, role):
+        out.append(f"no exported stem matches {role!r}; the fader move was omitted "
+                   f"(stems: {[s.split('/')[-1] for s in stems]})")
+    return out
 
 
 def build_mix_recipe(answers: dict, stems: list[str]) -> list[dict]:

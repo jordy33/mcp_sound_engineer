@@ -107,6 +107,36 @@ def test_clipping_counts_frames_not_channels():
     assert counted == 100, counted
 
 
+def test_noise_floor_requires_silence():
+    """Continuous music has no measurable floor; a gap does."""
+    rng = np.random.default_rng(0)
+    music = 0.2 * np.sin(2 * np.pi * 220 * np.arange(SR * 5) / SR)
+    assert analysis.noise_floor_dbfs(music, SR) is None
+    tone = 0.2 * np.sin(2 * np.pi * 220 * np.arange(SR * 3) / SR)
+    hiss = 0.01 * rng.normal(size=SR * 2)             # RMS ~ -40 dBFS in the gap
+    assert analysis.noise_floor_dbfs(np.concatenate([tone, hiss]), SR) > -45.0
+
+
+def test_lossy_cutoff_detection():
+    rng = np.random.default_rng(3)
+    full = 0.1 * rng.normal(size=SR * 10)
+    spec = np.fft.rfft(full)
+    freqs = np.fft.rfftfreq(len(full), 1 / SR)
+    spec[freqs > 16000] = 0                          # hard cliff, like a 128 kbps encode
+    cut = np.fft.irfft(spec, n=len(full))
+    assert analysis.spectral_cutoff(full, SR)["lossy_suspected"] is False
+    assert analysis.spectral_cutoff(cut, SR)["lossy_suspected"] is True
+
+
+def test_low_band_correlation_ignores_highs():
+    t = np.arange(SR * 3) / SR
+    bass = 0.4 * np.sin(2 * np.pi * 60 * t)
+    high = 0.4 * np.sin(2 * np.pi * 8000 * t)   # igual amplitud: el full-band da ~0
+    stereo = np.stack([bass + high, bass - high], axis=1)   # mono lows, inverted highs
+    assert analysis.low_band_correlation(stereo, SR) > 0.99
+    assert analysis.analyze_master(_wav(stereo))["stereo"]["phase_correlation"] < 0.5
+
+
 def test_json_safe_output():
     import json
     facts = analysis.analyze_master(_wav(_sine(440, 0.3)))

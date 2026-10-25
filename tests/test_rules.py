@@ -79,6 +79,28 @@ def test_sustained_clipping_does_send_back():
     assert rules.evaluate_gates(facts)["send_back"]
 
 
+def test_noise_floor_gate():
+    facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -1.0, "integrated_lufs": -18.0},
+             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
+             "noise": {"floor_dbfs": -40.0}, "duration_seconds": 200, "sample_rate": 44100}
+    assert "noise_floor:measured" in rules.evaluate_gates(facts)["reasons"]
+
+
+def test_lossy_source_gate():
+    facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -1.0, "integrated_lufs": -18.0},
+             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
+             "bandwidth": {"lossy_suspected": True}, "duration_seconds": 200, "sample_rate": 44100}
+    assert "lossy_source:measured" in rules.evaluate_gates(facts)["reasons"]
+
+
+def test_mix_warns_when_no_stem_matches():
+    answers = {"balance": {"choice": "vocal_too_high"}, "masking": {"score": 0.0},
+               "bus_comp": {"choice": "none"}}
+    warnings = rules.mix_warnings(answers, ["mixdown.wav"])
+    assert warnings and "vocal" in warnings[0], warnings
+    assert rules.mix_warnings(answers, ["01_vocals.wav"]) == []
+
+
 def test_unmastered_mix_is_not_sent_back():
     facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -1.0, "integrated_lufs": -18.0},
              "stereo": {"phase_correlation": 0.8}, "clipping": {"count": 3},

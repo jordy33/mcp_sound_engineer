@@ -19,6 +19,8 @@ def plain(obj):
         return float(obj)
     if isinstance(obj, np.integer):
         return int(obj)
+    if isinstance(obj, np.bool_):
+        return bool(obj)
     return obj
 
 
@@ -152,6 +154,46 @@ def clipping(stereo: np.ndarray, thr: float = 0.999) -> dict:
     return {"count": int(hits.any(axis=1).sum()) if hits.ndim > 1 else int(hits.sum())}
 
 
+def noise_floor_dbfs(mono: np.ndarray, sr: int, win_s: float = 0.1):
+    """Noise floor measured **only in silence**. Returns None when there is no silence.
+
+    On continuous music the quietest windows are soft passages, not noise: reporting them
+    as a floor would flag every track. Without a gap (or stems) the floor is unmeasurable.
+    """
+    win = max(1, int(win_s * sr))
+    if len(mono) < win * 4:
+        return None
+    rms = np.array([float(np.sqrt(np.mean(mono[i:i + win] ** 2)))
+                    for i in range(0, len(mono) - win, win)])
+    if rms.size == 0:
+        return None
+    db = 20 * np.log10(rms + 1e-12)
+    quietest, median = float(np.percentile(db, 2)), float(np.percentile(db, 50))
+    if median - quietest < 20.0:   # no real gap: the quiet windows are just soft music
+        return None
+    in_silence = db[db <= quietest + 6.0]
+    return round(float(np.percentile(in_silence, 90)), 1) if in_silence.size else None
+
+
+def spectral_cutoff(mono: np.ndarray, sr: int) -> dict:
+    """Detect a lossy-codec cliff: energy collapsing just above 16 kHz."""
+    nyquist = sr / 2
+    if nyquist < 20000:
+        return {"cutoff_hz": round(nyquist), "drop_db": 0.0, "lossy_suspected": False,
+                "note": "sample rate too low to test the 14-18 kHz region"}
+    seg = mono[: sr * 60] if len(mono) > sr * 60 else mono
+    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)))) ** 2
+    freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+
+    def band_db(lo, hi):
+        total = float(spec.sum()) + 1e-12
+        return 10 * np.log10(float(spec[(freqs >= lo) & (freqs < hi)].sum()) / total + 1e-12)
+
+    below, above = band_db(14000, 16000), band_db(16000, 18000)
+    drop = round(below - above, 1)
+    return {"cutoff_hz": 16000, "drop_db": drop, "lossy_suspected": bool(drop > 20.0)}
+
+
 def analyze_master(path: str) -> dict:
     data, sr = load(path)
     mono = _mono(data)
@@ -175,6 +217,8 @@ def analyze_master(path: str) -> dict:
         },
         "stereo": {"phase_correlation": stereo_correlation(data)},
         "clipping": clipping(data),
+        "noise": {"floor_dbfs": noise_floor_dbfs(mono, sr)},
+        "bandwidth": spectral_cutoff(mono, sr),
     }
     return plain(stats)
 
@@ -183,6 +227,24 @@ def _centroid(mono: np.ndarray, sr: int) -> int:
     spec = np.abs(np.fft.rfft(mono * np.hanning(len(mono)))) ** 2
     freqs = np.fft.rfftfreq(len(mono), 1 / sr)
     return int(float((freqs * spec).sum() / (spec.sum() + 1e-12)))
+
+
+def low_band_correlation(stereo: np.ndarray, sr: int, cutoff_hz: float = 120.0) -> float:
+    """Mono-bass check: L/R correlation below the cutoff, where a stereo bass collapses."""
+    if stereo.ndim != 2 or stereo.shape[1] < 2:
+        return 1.0
+    l, r = stereo[:, 0], stereo[:, 1]
+    spec_l, spec_r = np.fft.rfft(l), np.fft.rfft(r)
+    freqs = np.fft.rfftfreq(len(l), 1 / sr)
+    mask = freqs <= cutoff_hz
+    if not mask.any():
+        return 1.0
+    lo = np.fft.irfft(spec_l * mask, n=len(l))
+    ro = np.fft.irfft(spec_r * mask, n=len(r))
+    denom = np.std(lo) * np.std(ro)
+    if denom < 1e-9:
+        return 1.0
+    return round(float(np.corrcoef(lo, ro)[0, 1]), 3)
 
 
 def analyze_stems(paths: list[str]) -> dict:
@@ -197,6 +259,7 @@ def analyze_stems(paths: list[str]) -> dict:
             "rms_dbfs": round(20 * np.log10(np.sqrt(np.mean(mono ** 2)) + 1e-12), 2),
             "peak_dbfs": round(20 * np.log10(np.max(np.abs(mono)) + 1e-12), 2),
             "bands_db_rel": bands_db_rel(mono, sr),
+            "low_correlation": low_band_correlation(data, sr),
         })
     masking = []
     for i in range(len(stems)):
