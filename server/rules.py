@@ -176,7 +176,7 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
     dyn = choice("dynamics")
     if dyn == "glue":
         recipe.append(_action("compressor", target="mix_bus", ratio=2.0, attack_ms=20, release_ms=200,
-                              gain_reduction_db=clamp(score("dynamics_amount") / 2, 0.5, 3.0)))
+                              gain_reduction_db=clamp(0.5 + 0.5 * score("dynamics_amount"), 0.5, 3.0)))
     elif dyn == "expand":
         recipe.append(_action("compressor", target="mix_bus", mode="upward_expand",
                               reason="restore range on over-compressed material"))
