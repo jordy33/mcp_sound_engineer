@@ -1,0 +1,31 @@
+name: ci
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        python: ["3.9", "3.11", "3.12"]
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/setup-python@v5
+        with:
+          python-version: ${{ matrix.python }}
+      - name: install
+        run: |
+          python -m pip install --upgrade pip
+          pip install numpy
+      - name: smoke (protocol + analysis)
+        run: python tests/test_smoke.py
+      - name: rules (domain behaviour)
+        run: python tests/test_rules.py
+      - name: analysis (known-answer signals)
+        run: python tests/test_analysis.py
+      - name: installable
+        run: pip install -e . && python -c "import server.rules as r; print(r.RULES_VERSION)"

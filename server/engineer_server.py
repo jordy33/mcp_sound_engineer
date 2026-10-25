@@ -9,9 +9,14 @@ from __future__ import annotations
 import json
 import sys
 
-from analysis import analyze_master, analyze_stems
-from jev import JevError, ask, config
-import rules
+try:  # installed as a package
+    from . import rules
+    from .analysis import analyze_master, analyze_reference, analyze_sections, analyze_stems
+    from .jev import JevError, ask, config
+except ImportError:  # executed as a script: python server/engineer_server.py
+    import rules
+    from analysis import analyze_master, analyze_reference, analyze_sections, analyze_stems
+    from jev import JevError, ask, config
 
 SERVER_NAME = "mcp_sound_engineer"
 SERVER_VERSION = "0.1.0"
@@ -32,9 +37,30 @@ def tool_analyze_stems(paths: list[str]) -> dict:
     return analyze_stems(paths)
 
 
-def tool_judge_master(path: str, platform: str = "spotify") -> dict:
+def tool_analyze_sections(path: str, window_s: float = 30.0) -> dict:
+    return analyze_sections(path, window_s)
+
+
+def tool_analyze_reference(path: str) -> dict:
+    return analyze_reference(path)
+
+
+def tool_validate_recipe(recipe: list) -> dict:
+    violations = rules.validate_recipe(recipe)
+    return {"valid": not violations, "violations": violations,
+            "schema": rules.RECIPE_SCHEMA_VERSION}
+
+
+def tool_judge_master(path: str, platform: str = "spotify",
+                      reference_path: str | None = None,
+                      previous_path: str | None = None) -> dict:
     facts = analyze_master(path)
     target = rules.loudness_target(platform)
+    if reference_path:
+        measured = analyze_reference(reference_path)
+        reference_curve = measured["reference_curve"]
+    else:
+        measured, reference_curve = None, rules.REFERENCE_CURVE
     state = {
         "context": {"stage": "mastering", "platform": platform,
                     "playback_normalization_lufs": target["normalization_lufs"],
@@ -42,14 +68,21 @@ def tool_judge_master(path: str, platform: str = "spotify") -> dict:
                     "note": "streaming loudness is normalized on playback; the master is not "
                             "required to reach the normalization figure"},
         "facts": facts,
-        "reference_curve": rules.REFERENCE_CURVE,
+        "reference_curve": reference_curve,
         "limits": rules.GATE,
     }
     answers = ask(state, MASTER_QUESTIONS)
+    warnings = rules.loudness_warnings(facts, target)
+    if previous_path:
+        drop = rules.correlation_drop(analyze_master(previous_path), facts)
+        if drop["exceeds"]:
+            warnings.append(f"phase correlation dropped {drop['drop']} after the chain "
+                            f"({drop['before']} -> {drop['after']}); check the last stage added")
     return {"facts": facts, "answers": answers,
             "recipe": rules.build_master_recipe(answers, facts, platform),
             "target": target,
-            "warnings": rules.loudness_warnings(facts, target)}
+            "reference": measured,
+            "warnings": warnings}
 
 
 def tool_judge_mix(paths: list[str]) -> dict:
@@ -70,7 +103,7 @@ def tool_engineer_info() -> dict:
             "rules_version": rules.RULES_VERSION,
             "jev_configured": bool(cfg["key"]), "jev_model": cfg["model"],
             "platforms": sorted(rules.PLATFORMS),
-            "tools": ["analyze_master", "analyze_stems", "judge_master", "judge_mix", "engineer_info"]}
+            "tools": sorted(TOOLS)}
 
 
 TOOLS = {
@@ -80,6 +113,21 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}},
                         "required": ["path"]},
         "handler": lambda a: tool_analyze_master(a["path"]),
+    },
+    "analyze_sections": {
+        "description": "Per-window analysis (default 30 s): LUFS, band balance and correlation "
+                       "per section, plus which windows deviate from the file median.",
+        "inputSchema": {"type": "object", "properties": {
+            "path": {"type": "string"},
+            "window_s": {"type": "number"}}, "required": ["path"]},
+        "handler": lambda a: tool_analyze_sections(a["path"], a.get("window_s", 30.0)),
+    },
+    "analyze_reference": {
+        "description": "Measure a commercial reference track; its band balance becomes the "
+                       "reference curve used by judge_master.",
+        "inputSchema": {"type": "object", "properties": {"path": {"type": "string"}},
+                        "required": ["path"]},
+        "handler": lambda a: tool_analyze_reference(a["path"]),
     },
     "analyze_stems": {
         "description": "Measure N stems: per-stem loudness and band balance, plus pairwise masking.",
@@ -92,8 +140,11 @@ TOOLS = {
                        "Enforces the craft's hard caps (3 dB corrective, 3 dB GR, -1 dBTP).",
         "inputSchema": {"type": "object", "properties": {
             "path": {"type": "string"},
-            "platform": {"type": "string", "enum": list(rules.PLATFORMS)}}, "required": ["path"]},
-        "handler": lambda a: tool_judge_master(a["path"], a.get("platform", "spotify")),
+            "platform": {"type": "string", "enum": list(rules.PLATFORMS)},
+            "reference_path": {"type": "string"},
+            "previous_path": {"type": "string"}}, "required": ["path"]},
+        "handler": lambda a: tool_judge_master(a["path"], a.get("platform", "spotify"),
+                                               a.get("reference_path"), a.get("previous_path")),
     },
     "judge_mix": {
         "description": "Typed mixing decisions via Jev: balance, masking, bus compression, "
@@ -101,6 +152,13 @@ TOOLS = {
         "inputSchema": {"type": "object", "properties": {
             "paths": {"type": "array", "items": {"type": "string"}}}, "required": ["paths"]},
         "handler": lambda a: tool_judge_mix(a["paths"]),
+    },
+    "validate_recipe": {
+        "description": "Adapter contract check: verify a recipe against the schema and the caps "
+                       "before applying it. Returns {valid, violations}.",
+        "inputSchema": {"type": "object", "properties": {
+            "recipe": {"type": "array", "items": {"type": "object"}}}, "required": ["recipe"]},
+        "handler": lambda a: tool_validate_recipe(a["recipe"]),
     },
     "engineer_info": {
         "description": "Server status: rules version, Jev configuration, supported platforms.",

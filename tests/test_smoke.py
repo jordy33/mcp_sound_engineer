@@ -47,7 +47,8 @@ def test_mcp_handshake():
     assert init["result"]["serverInfo"]["name"] == "mcp_sound_engineer"
     listing = send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     names = {t["name"] for t in listing["result"]["tools"]}
-    assert names == {"analyze_master", "analyze_stems", "judge_master", "judge_mix", "engineer_info"}
+    assert names == {"analyze_master", "analyze_stems", "analyze_sections", "analyze_reference",
+                     "judge_master", "judge_mix", "validate_recipe", "engineer_info"}
     info = send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                  "params": {"name": "engineer_info", "arguments": {}}})
     assert info["result"]["isError"] is False

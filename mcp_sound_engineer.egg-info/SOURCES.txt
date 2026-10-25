@@ -1,0 +1,17 @@
+LICENSE
+README.md
+pyproject.toml
+mcp_sound_engineer.egg-info/PKG-INFO
+mcp_sound_engineer.egg-info/SOURCES.txt
+mcp_sound_engineer.egg-info/dependency_links.txt
+mcp_sound_engineer.egg-info/entry_points.txt
+mcp_sound_engineer.egg-info/requires.txt
+mcp_sound_engineer.egg-info/top_level.txt
+server/__init__.py
+server/analysis.py
+server/engineer_server.py
+server/jev.py
+server/rules.py
+tests/test_analysis.py
+tests/test_rules.py
+tests/test_smoke.py

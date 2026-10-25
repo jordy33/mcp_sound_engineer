@@ -88,8 +88,11 @@ Register it in any MCP client, next to your DAW adapter — they are separate se
 | Tool | Input | Returns |
 |---|---|---|
 | `analyze_master` | one stereo file | LUFS, true peak, LRA, crest, phase correlation, 6 bands, centroid, clipping |
-| `analyze_stems` | N files | per-stem loudness + bands, pairwise masking matrix |
-| `judge_master` | path + platform | `answers` (typed) + `recipe` |
+| `analyze_stems` | N files | per-stem loudness, bands, low-band correlation, pairwise masking, and stem gates (buried vocal, outlier element, mono bass) |
+| `analyze_sections` | path + window | per-window LUFS/bands/correlation and which windows deviate from the median |
+| `analyze_reference` | path | a commercial reference's band balance, to feed `judge_master` |
+| `validate_recipe` | recipe | adapter-side contract check: caps, schema, terminal `send_back` |
+| `judge_master` | path, platform, optional `reference_path` / `previous_path` | `answers` + `recipe` + `warnings` (incl. correlation drop after the chain) |
 | `judge_mix` | stem paths | `answers` + `recipe` |
 | `engineer_info` | — | rules version, Jev status, platforms |
 
@@ -116,7 +119,8 @@ one source of truth for both the numbers and the answer keys.
 | Dither | only when reducing to a fixed bit depth | `PLATFORMS[...]["dither"]` | none for streaming, TPDF for CD/podcast |
 | Playback normalization | Spotify −14, Apple −16, … | `PLATFORMS` | informational; never a delivery target |
 | Unknown destination | — | `loudness_target` | raises, no silent fallback |
-| Reference curve | normalized so the six bands sum to 0 dB | `REFERENCE_CURVE` | linear sum = 1.0 |
+| Reference curve | measured from a real track, or the normalized default | `analyze_reference`, `REFERENCE_CURVE` | linear sum = 1.0 when no reference is passed |
+| Correlation drop after the chain | > 0.15 | `correlation_drop` | warning when `previous_path` is given |
 | Noise floor | > −50 dB | `GATE.noise_floor_moderate_db` | **measured in silence only**; `None` when the file has no gap |
 | Lossy source | cliff > 20 dB between 14–16 k and 16–18 k | `GATE.lossy_shelf_drop_db` | **measured** → `send_back` |
 | `eq.shelf`, `dynamic_eq`, `stereo.width`, `pan` | vocabulary only | `ACTIONS` | ❌ never emitted |
@@ -128,7 +132,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 42 assertions: smoke + rules + analysis
+./start-sound-engineer-mcp.sh --test     # 51 assertions: smoke + rules + analysis
 ```
 
 `tests/test_rules.py` asserts behaviour, not arithmetic:
@@ -187,7 +191,7 @@ sensitivity to a known change, not agreement with a trained ear.
 
 ## 8. Status
 
-`0.2.0` (rules 2.0.0). What is missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md): noise-floor and lossy-source
+`0.3.0` (rules 2.0.0). What is missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md): noise-floor and lossy-source
 detectors, reference-track analysis (the reference curve is still a constant), per-section analysis,
 `dry_run`, confidence policy, packaging and CI.
 

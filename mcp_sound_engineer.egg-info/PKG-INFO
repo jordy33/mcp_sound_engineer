@@ -1,0 +1,12 @@
+Metadata-Version: 2.4
+Name: mcp-sound-engineer
+Version: 0.1.0
+Summary: MCP server: measures audio and returns DAW-neutral mix/master decisions
+Requires-Python: >=3.9
+License-File: LICENSE
+Requires-Dist: numpy>=1.24
+Provides-Extra: formats
+Requires-Dist: soundfile>=0.12; extra == "formats"
+Provides-Extra: exact
+Requires-Dist: pyloudnorm>=0.1.1; extra == "exact"
+Dynamic: license-file

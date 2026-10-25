@@ -217,6 +217,49 @@ def test_recipe_never_reads_a_key_the_schema_lacks():
                 raise AssertionError(f"{builder.__name__} tolerated missing {key!r}")
 
 
+def test_validate_recipe_catches_cap_violations():
+    bad = [
+        {"action": "eq.bell", "target": "master", "schema": rules.RECIPE_SCHEMA_VERSION,
+         "freq_hz": 300, "gain_db": -5.0, "role": "corrective"},
+        {"action": "compressor", "target": "master", "schema": rules.RECIPE_SCHEMA_VERSION,
+         "gain_reduction_db": 9.0},
+        {"action": "limiter", "target": "master", "schema": rules.RECIPE_SCHEMA_VERSION,
+         "ceiling_dbtp": -1.0, "expected_gain_reduction_db": 8.0},
+    ]
+    codes = {v["code"] for v in rules.validate_recipe(bad)}
+    assert {"corrective_cap", "gain_reduction_cap", "limiter_cap"} <= codes, codes
+
+
+def test_validate_recipe_rejects_send_back_not_terminal():
+    recipe = [
+        {"action": "send_back", "target": "master", "schema": rules.RECIPE_SCHEMA_VERSION,
+         "reasons": ["already_mastered:measured"]},
+        {"action": "limiter", "target": "master", "schema": rules.RECIPE_SCHEMA_VERSION},
+    ]
+    assert "send_back_not_terminal" in {v["code"] for v in rules.validate_recipe(recipe)}
+
+
+def test_validate_recipe_rejects_unknown_action_and_schema():
+    recipe = [{"action": "eq.teleport", "target": "master", "schema": "1.0.0"}]
+    codes = {v["code"] for v in rules.validate_recipe(recipe)}
+    assert "unknown_action" in codes
+
+
+def test_validate_recipe_accepts_a_good_recipe():
+    facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -1.0, "integrated_lufs": -18.0},
+             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
+             "duration_seconds": 200, "sample_rate": 44100}
+    good = rules.build_master_recipe(_answers(), facts, "spotify")
+    assert rules.validate_recipe(good) == [], good
+
+
+def test_correlation_drop_detects_image_loss():
+    before = {"stereo": {"phase_correlation": 0.9}}
+    after = {"stereo": {"phase_correlation": 0.6}}
+    assert rules.correlation_drop(before, after)["exceeds"] is True
+    assert rules.correlation_drop(before, {"stereo": {"phase_correlation": 0.85}})["exceeds"] is False
+
+
 def test_action_rejects_unknown_target():
     try:
         rules._action("limiter", target="monitor")

@@ -1,0 +1,7 @@
+numpy>=1.24
+
+[exact]
+pyloudnorm>=0.1.1
+
+[formats]
+soundfile>=0.12

@@ -293,6 +293,52 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
     return recipe
 
 
+def correlation_drop(before: dict, after: dict, limit: float = 0.15) -> dict:
+    """The source's post-chain check: cumulative phase rotation must not eat the image."""
+    b = float((before.get("stereo") or {}).get("phase_correlation", 1.0))
+    a = float((after.get("stereo") or {}).get("phase_correlation", 1.0))
+    drop = round(b - a, 3)
+    return {"before": b, "after": a, "drop": drop, "exceeds": drop > limit}
+
+
+def validate_recipe(recipe: list) -> list[dict]:
+    """Adapter-side contract check: run it before touching the session."""
+    if not isinstance(recipe, list):
+        return [{"code": "not_a_list"}]
+    violations: list[dict] = []
+    send_back = [a for a in recipe if isinstance(a, dict) and a.get("action") == "send_back"]
+    if send_back and len(recipe) > 1:
+        violations.append({"code": "send_back_not_terminal"})
+    corrective = 0.0
+    for index, action in enumerate(recipe):
+        if not isinstance(action, dict):
+            violations.append({"code": "not_an_action", "index": index}); continue
+        name = action.get("action")
+        if name not in ACTIONS:
+            violations.append({"code": "unknown_action", "index": index, "action": name}); continue
+        if action.get("target") not in TARGETS:
+            violations.append({"code": "unknown_target", "index": index})
+        if action.get("schema") != RECIPE_SCHEMA_VERSION:
+            violations.append({"code": "schema_mismatch", "index": index,
+                               "schema": action.get("schema")})
+        if name == "eq.bell" and action.get("role") == "corrective":
+            gain = abs(float(action.get("gain_db", 0.0)))
+            if gain > GATE["max_corrective_db_per_point"]:
+                violations.append({"code": "corrective_cap", "index": index, "gain_db": gain})
+            corrective += gain
+        if name == "compressor" and float(action.get("gain_reduction_db", 0)) > GATE["max_gain_reduction_db"]:
+            violations.append({"code": "gain_reduction_cap", "index": index})
+        if name == "limiter" and float(action.get("expected_gain_reduction_db", 0)) > GATE["max_limiter_gr_db"]:
+            violations.append({"code": "limiter_cap", "index": index})
+        if name == "eq.high_pass" and float(action.get("freq_hz", 0)) > 30:
+            violations.append({"code": "high_pass_range", "index": index})
+        if name == "dither" and int(action.get("bit_depth", 24)) not in (16, 24):
+            violations.append({"code": "dither_bit_depth", "index": index})
+    if corrective > GATE["max_cumulative_corrective_db"]:
+        violations.append({"code": "cumulative_cap", "total_db": round(corrective, 2)})
+    return violations
+
+
 def mix_warnings(answers: dict, stems: list[str]) -> list[str]:
     """Say out loud when a decision cannot be applied to the exported files."""
     out: list[str] = []

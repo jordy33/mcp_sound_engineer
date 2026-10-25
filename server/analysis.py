@@ -247,6 +247,53 @@ def low_band_correlation(stereo: np.ndarray, sr: int, cutoff_hz: float = 120.0) 
     return round(float(np.corrcoef(lo, ro)[0, 1]), 3)
 
 
+def analyze_reference(path: str) -> dict:
+    """Measure a commercial reference: its band balance becomes the reference curve."""
+    data, sr = load(path)
+    mono = _mono(data)
+    return plain({
+        "file": os.path.abspath(path),
+        "reference_curve": bands_db_rel(mono, sr),
+        "integrated_lufs": integrated_lufs(mono, sr),
+        "true_peak_dbtp": true_peak_dbtp(mono, sr),
+        "loudness_range_lu": loudness_range(mono, sr),
+        "phase_correlation": stereo_correlation(data),
+    })
+
+
+def analyze_sections(path: str, window_s: float = 30.0) -> dict:
+    """Per-window analysis. A hot chorus disappears in a whole-file average."""
+    data, sr = load(path)
+    mono = _mono(data)
+    win = int(window_s * sr)
+    if len(mono) < win:
+        return {"window_s": window_s, "windows": [],
+                "note": "file shorter than one window; use analyze_master"}
+    windows = []
+    for start in range(0, len(mono) - win + 1, win):
+        seg, chunk = mono[start:start + win], data[start:start + win]
+        windows.append({"start_s": round(start / sr, 1),
+                        "integrated_lufs": integrated_lufs(seg, sr),
+                        "bands_db_rel": bands_db_rel(seg, sr),
+                        "phase_correlation": stereo_correlation(chunk)})
+    median_lufs = float(np.median([w["integrated_lufs"] for w in windows]))
+    median_bands = {b: float(np.median([w["bands_db_rel"][b] for w in windows])) for b in BANDS}
+    tilt = [w["bands_db_rel"]["high_mid"] - w["bands_db_rel"]["bass"] for w in windows]
+    median_tilt = float(np.median(tilt))
+    for w, t in zip(windows, tilt):
+        w["deviation_db"] = {b: round(w["bands_db_rel"][b] - median_bands[b], 1) for b in BANDS}
+        w["lufs_delta"] = round(w["integrated_lufs"] - median_lufs, 1)
+        w["tilt"] = round(t, 1)
+        w["tilt_delta"] = round(t - median_tilt, 1)
+        # A single robust criterion: loudness or spectral tilt moving away from the file median.
+        w["flagged"] = abs(w["lufs_delta"]) > 3.0 or abs(w["tilt_delta"]) > 3.0
+    return plain({"window_s": window_s, "windows": windows,
+                  "median_lufs": round(median_lufs, 2),
+                  "median_bands_db_rel": {k: round(v, 1) for k, v in median_bands.items()},
+                  "median_tilt": round(median_tilt, 1),
+                  "flagged_windows": [w["start_s"] for w in windows if w["flagged"]]})
+
+
 def analyze_stems(paths: list[str]) -> dict:
     """Per-stem measurements plus a roughness matrix between stems."""
     stems = []

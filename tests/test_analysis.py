@@ -164,6 +164,25 @@ def test_stem_gate_mono_bass():
     assert facts["gates"][0]["gate"] == "mono_bass", facts["gates"]
 
 
+def test_sections_flag_a_hot_window():
+    t = np.arange(SR * 12) / SR
+    quiet = 0.05 * np.sin(2 * np.pi * 220 * t[: SR * 6])
+    loud = 0.9 * np.sin(2 * np.pi * 220 * t[: SR * 6])
+    facts = analysis.analyze_sections(_wav(np.concatenate([quiet, loud])), window_s=6.0)
+    assert len(facts["windows"]) == 2
+    assert facts["flagged_windows"], facts
+    assert len(facts["flagged_windows"]) < len(facts["windows"]), facts["flagged_windows"]
+    lufs = [w["integrated_lufs"] for w in facts["windows"]]
+    assert max(lufs) - min(lufs) > 10, lufs
+
+
+def test_reference_curve_is_measurable():
+    t = np.arange(SR * 5) / SR
+    ref = analysis.analyze_reference(_wav(0.3 * np.sin(2 * np.pi * 80 * t)))
+    assert set(ref["reference_curve"]) == {"sub", "bass", "low_mid", "mid", "high_mid", "high"}
+    assert ref["reference_curve"]["bass"] > ref["reference_curve"]["high"]
+
+
 def test_json_safe_output():
     import json
     facts = analysis.analyze_master(_wav(_sine(440, 0.3)))
