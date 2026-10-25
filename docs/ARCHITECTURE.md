@@ -12,7 +12,7 @@ Logic / REAPER / Ableton ──► mcp_sound_engineer ──► analysis.py   (n
         │                        │
         │                        │ (3) recipe
         └──── adapter MCP ◄──────┘  rules.py (caps + neutral actions)
-              (mcp_logic, reaper-mcp, ...)
+              (your adapter)
 ```
 
 ## Why not fuse them

@@ -8,7 +8,7 @@ It does not control any DAW, and it never will. It is one of two separate MCPs:
 ```
 ┌───────────────────────┐   facts + answers + recipe   ┌──────────────────────┐
 │  mcp_sound_engineer   │ ───────────────────────────► │  adapter MCP (any)   │
-│  measure → judge      │        (neutral JSON)        │  mcp_logic · reaper  │
+│  measure → judge      │        (neutral JSON)        │  adapter MCP (yours) │
 └───────────────────────┘                              └──────────────────────┘
         numpy + Jev                                         applies the plan
 ```
@@ -23,26 +23,36 @@ or a plain CLI — the adapter is replaceable, the engineer is not.
 | **Mixing engineer** | N recorded stems | balance, masking, corrective EQ, bus glue, fader moves |
 | **Mastering engineer** | one stereo file | send-back gates, corrective/tonal EQ, dynamics, limiter, loudness target, dither |
 
-## Why typed decisions (and why Jev)
+## Why a typed decision model
 
-A generative model writes prose; this server needs a decision a program can act on. The judge is
-[Jev](https://jevtypesafeai.com), a *System One* model trained for calibrated decisions (RLCD):
-it answers `choice` / `score` / `noul` with probabilities and cannot emit an invalid label.
+The judge is a *System One* decision model: it returns `choice` / `score` / `noul` with
+probabilities instead of prose. That is an architectural requirement, not a preference:
 
-Measured evidence, 24 real music clips, 8 tracks × 3 versions (original, +3.4 dB at 60–250 Hz,
-+5.3 dB at 6–16 kHz):
+* a `choice` can only return a label we declared — no invented categories;
+* a `score` always lands on the scale we declared — no parsing, no regex;
+* a `noul` is a number in [0,1] — thresholdable by code;
+* ~0.3 s and ~$0.0002 per decision, so it can run inside an agent loop.
 
-| Task | Jev | Gemini 3.8 Flash (audio) |
-|---|---|---|
-| Detect +5.3 dB of added highs | **8/8**, mean +22.4 pts | 4/8, mean +6.1 pts |
-| Detect +3.4 dB of added lows | **5/8**, mean +5.4 pts | 3/8, mean −1.6 pts |
-| Spearman(measured tilt, "bright") | **+0.77** | +0.24 |
-| Spearman(measured tilt, "muddy") | −0.49 | **+0.42 (inverted)** |
-| Stability across runs | ±1 pt | ±17 pts between tracks |
+A generative model cannot be held to fixed rules: it may ignore the thresholds, invent a plugin, or
+disagree with itself between two identical calls. For a decision that moves a fader, that is
+disqualifying.
 
-The audio model hears a 16 kHz mono clip with no reference; the decision model gets the measurement
-and the reference curve. For *measuring*, feeding the measurement wins. (Both are far from a human
-engineer — see `docs/LIMITS.md`.)
+### What we verified
+
+24 real music clips — 8 tracks x 3 versions (original, +3.4 dB at 60–250 Hz, +5.3 dB at 6–16 kHz):
+
+| Check | Result |
+|---|---|
+| Direction on +5.3 dB of added highs | **8/8** |
+| Direction on +3.4 dB of added lows | 5/8 (both failures were scale saturation, not blindness) |
+| Spearman(measured tilt, "bright") | **+0.77** |
+| Stability across runs | ±1 point |
+
+### What we have not verified
+
+No human labels yet. One repetition per clip. Perturbations are synthetic. This measures sensitivity
+to a known change; it does **not** measure agreement with a trained ear. Every threshold in
+`rules.py` is a starting point, not a validated constant.
 
 ## Tools
 
@@ -70,7 +80,7 @@ Recipes are arrays of actions. No plugin, vendor or DAW name ever appears:
 ```
 
 Full schema: [`docs/RECIPE.md`](docs/RECIPE.md). An adapter maps `eq.bell` → Channel EQ band (Logic),
-ReaEQ (REAPER), EQ3 (Pro Tools). It must reject anything outside the caps and report back what it
+any EQ. It must reject anything outside the caps and report back what it
 actually applied.
 
 ## The rules

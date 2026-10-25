@@ -2,7 +2,7 @@
 
 Every number here is a hard cap, not a suggestion. No DAW, plugin or vendor name
 lives in this module: recipes are expressed in `action` primitives that any
-adapter (mcp_logic, reaper-mcp, a Pro Tools bridge, a CLI) can translate.
+adapter (a DAW bridge, a CLI, a test harness) can translate.
 
 Sources: mastering-engineer methodology (fadelabs/phantom) + 2026 platform targets.
 """
@@ -56,7 +56,7 @@ REFERENCE_CURVE = {
 
 # --- Neutral action vocabulary ---------------------------------------------
 # An adapter maps `action` to its own surface. Examples of the mapping are the
-# adapter's job, never ours: Logic's Channel EQ, REAPER's ReaEQ, Pro Tools' EQ3.
+# adapter's job, never ours: Channel EQ, ReaEQ, EQ3, a custom chain.
 ACTIONS = {
     "eq.high_pass":  "high-pass filter",
     "eq.bell":       "parametric bell (corrective: q 4-8)",
