@@ -269,4 +269,36 @@ def analyze_stems(paths: list[str]) -> dict:
                           for k in BANDS) / len(BANDS)
             masking.append({"a": a["name"], "b": b["name"], "band_overlap_db": round(overlap, 2)})
     masking.sort(key=lambda m: -m["band_overlap_db"])
-    return plain({"stems": stems, "masking_pairs": masking[:5]})
+    return plain({"stems": stems, "masking_pairs": masking[:5],
+                  "gates": stem_gates(stems)})
+
+
+VOCAL_HINTS = ("vocal", "vox", "voice", "lead", "voz")
+
+
+def stem_gates(stems: list[dict]) -> list[dict]:
+    """Conditions that need a mix fix, measured on the exported stems."""
+    out: list[dict] = []
+    vocals = [s for s in stems if any(h in s["name"].lower() for h in VOCAL_HINTS)]
+    rest = [s for s in stems if s not in vocals]
+    if vocals and rest:
+        v = 10 ** (vocals[0]["rms_dbfs"] / 10)
+        others = sum(10 ** (s["rms_dbfs"] / 10) for s in rest)
+        relative = round(float(10 * np.log10(v / (others + 1e-12) + 1e-12)), 1)
+        if relative < -12.0:
+            out.append({"gate": "vocal_buried", "stem": vocals[0]["name"],
+                        "relative_db": relative})
+
+    peaks = [s["peak_dbfs"] for s in stems]
+    if len(peaks) >= 3:
+        excess = round(float(max(peaks) - np.median(peaks)), 1)
+        if excess > 6.0:
+            loudest = stems[int(np.argmax(peaks))]
+            out.append({"gate": "single_element_peak", "stem": loudest["name"],
+                        "excess_db": excess})
+
+    for s in stems:
+        if s["low_correlation"] < 0.3:
+            out.append({"gate": "mono_bass", "stem": s["name"],
+                        "low_correlation": s["low_correlation"]})
+    return out

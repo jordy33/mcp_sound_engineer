@@ -18,9 +18,9 @@ import analysis  # noqa: E402
 SR = 44100
 
 
-def _wav(samples: np.ndarray, sr: int = SR) -> str:
+def _wav(samples: np.ndarray, sr: int = SR, name: str = "t.wav") -> str:
     """Write a float array (frames, channels) in [-1,1] to a temp WAV; returns the path."""
-    path = os.path.join(tempfile.mkdtemp(), "t.wav")
+    path = os.path.join(tempfile.mkdtemp(), name)
     data = np.atleast_2d(samples.T).T if samples.ndim > 1 else samples.reshape(-1, 1)
     pcm = (np.clip(data, -1, 1) * 32767).astype("<i2")
     with wave.open(path, "wb") as w:
@@ -135,6 +135,33 @@ def test_low_band_correlation_ignores_highs():
     stereo = np.stack([bass + high, bass - high], axis=1)   # mono lows, inverted highs
     assert analysis.low_band_correlation(stereo, SR) > 0.99
     assert analysis.analyze_master(_wav(stereo))["stereo"]["phase_correlation"] < 0.5
+
+
+def test_stem_gate_vocal_buried():
+    t = np.arange(SR * 4) / SR
+    facts = analysis.analyze_stems([
+        _wav(0.02 * np.sin(2 * np.pi * 300 * t), name="01_vocals.wav"),
+        _wav(0.5 * np.sin(2 * np.pi * 100 * t), name="02_drums.wav"),
+        _wav(0.4 * np.sin(2 * np.pi * 60 * t), name="03_bass.wav"),
+    ])
+    assert [g["gate"] for g in facts["gates"]] == ["vocal_buried"], facts["gates"]
+
+
+def test_stem_gate_clean_mix_has_no_gates():
+    t = np.arange(SR * 4) / SR
+    facts = analysis.analyze_stems([
+        _wav(0.3 * np.sin(2 * np.pi * 300 * t), name="01_vocals.wav"),
+        _wav(0.3 * np.sin(2 * np.pi * 100 * t), name="02_drums.wav"),
+        _wav(0.3 * np.sin(2 * np.pi * 60 * t), name="03_bass.wav"),
+    ])
+    assert facts["gates"] == [], facts["gates"]
+
+
+def test_stem_gate_mono_bass():
+    t = np.arange(SR * 4) / SR
+    bass, high = 0.4 * np.sin(2 * np.pi * 60 * t), 0.2 * np.sin(2 * np.pi * 5000 * t)
+    facts = analysis.analyze_stems([_wav(np.stack([bass + high, -bass + high], axis=1), name="02_bass.wav")])
+    assert facts["gates"][0]["gate"] == "mono_bass", facts["gates"]
 
 
 def test_json_safe_output():

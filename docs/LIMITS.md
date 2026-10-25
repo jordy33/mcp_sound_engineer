@@ -12,6 +12,9 @@ those numbers, which means:
 * it cannot prefer one take over another;
 * it cannot be surprised. If the measurement does not capture a problem, the problem does not exist.
 
+Not implemented yet: correlation drop **after** the chain (needs a before/after file), per-section
+analysis, and reference-track deviation (the reference curve is a constant).
+
 ## Measurement approximations
 
 | Metric | Reality |
@@ -21,6 +24,9 @@ those numbers, which means:
 | `loudness_range_lu` | short-term P95−P10, indicative |
 | `phase_correlation` | one number for the whole file; it does not localize |
 | masking matrix | average band overlap, not perceptual masking |
+| noise floor | measurable **only inside a real gap**; returns `None` on continuous music |
+| lossy detection | a cliff test at 16 kHz; a 22 kHz cut on a 44.1 kHz file still looks "full band" |
+| stem gates | need named stems (`vocals`, `drums`, `bass`); an unnamed export cannot be role-matched |
 | reference curve | a **constant**, not a measured commercial reference (see roadmap) |
 
 ## It does not know the music
