@@ -92,7 +92,7 @@ Register it in any MCP client, next to your DAW adapter — they are separate se
 | `analyze_sections` | path + window | per-window LUFS/bands/correlation and which windows deviate from the median |
 | `analyze_reference` | path | a commercial reference's band balance, to feed `judge_master` |
 | `validate_recipe` | recipe | adapter-side contract check: caps, schema, terminal `send_back` |
-| `judge_master` | path, platform, optional `reference_path` / `previous_path` | `answers` + `recipe` + `warnings` (incl. correlation drop after the chain) |
+| `judge_master` | path, platform, optional `reference_path` / `previous_path` | `answers` + `recipe` + `warnings`; **measured gates run before the model**, so a refusal needs no key |
 | `judge_mix` | stem paths | `answers` + `recipe` |
 | `engineer_info` | — | rules version, Jev status, platforms |
 
@@ -113,10 +113,12 @@ one source of truth for both the numbers and the answer keys.
 | Already a finished master | LRA < 4 **and** TP > −1 **and** LUFS > −12 | `MAX_LRA_FINISHED` | **measured** → `send_back` (product rule) |
 | Corrective EQ per point | ≤ 3 dB | `GATE.max_corrective_db_per_point` | over the cap → `send_back`, never clamped |
 | Cumulative corrective EQ | ≤ 6 dB | `GATE.max_cumulative_corrective_db` | includes the sibilance cut |
+| Total gain reduction | ≤ 6 dB (source range 6–8) | `GATE.max_total_gain_reduction_db` | compressor + limiter summing over budget → `send_back` |
+| Mono compatibility | fold-down loss < 6 dB | `GATE.min_mono_cancel_db` | warning with the measured loss |
 | Broadband compression | 1.5–3:1, 10–30 ms, 1–3 dB GR | `CHAIN`, `GATE.min/max_gain_reduction_db` | emitted on the master bus |
 | De-esser | after compression | `CHAIN` | emitted after the compressor |
 | Limiter | ceiling from the destination, GR computed | `expected_limiter_gr` | arithmetic from measured LUFS, not a model score |
-| Dither | only when reducing to a fixed bit depth | `PLATFORMS[...]["dither"]` | none for streaming, TPDF for CD/podcast |
+| Dither | only when the destination needs fewer bits than the source | `PLATFORMS[...]`, `facts.bit_depth` | none for streaming; TPDF for CD/podcast only if reducing |
 | Playback normalization | Spotify −14, Apple −16, … | `PLATFORMS` | informational; never a delivery target |
 | Unknown destination | — | `loudness_target` | raises, no silent fallback |
 | Reference curve | measured from a real track, or the normalized default | `analyze_reference`, `REFERENCE_CURVE` | linear sum = 1.0 when no reference is passed |
@@ -132,7 +134,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 51 assertions: smoke + rules + analysis
+./start-sound-engineer-mcp.sh --test     # 65 assertions: smoke + rules + analysis
 ```
 
 `tests/test_rules.py` asserts behaviour, not arithmetic:
@@ -191,9 +193,15 @@ sensitivity to a known change, not agreement with a trained ear.
 
 ## 8. Status
 
-`0.3.0` (rules 2.0.0). What is missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md): noise-floor and lossy-source
-detectors, reference-track analysis (the reference curve is still a constant), per-section analysis,
-`dry_run`, confidence policy, packaging and CI.
+`0.4.0` (rules 2.0.0). Measurement, gates, sections, references and the recipe contract are in place,
+with CI on 3.9/3.11/3.12. What is still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
+
+* **denoise, dynamic EQ, tonal shelves** — vocabulary without an action;
+* **no adapter** — nothing applies the recipe to a real session yet (fader is 0–1 in Logic, plugin
+  parameters are raw AX values);
+* **the mix half is thin** — no gain staging, phase-before-EQ, HPF policy or panning;
+* **confidence policy** — answers below a threshold still produce a recipe instead of a refusal;
+* **no human-labelled evaluation** — sensitivity is measured, agreement with an engineer is not.
 
 ## License
 

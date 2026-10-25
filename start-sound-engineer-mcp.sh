@@ -11,14 +11,14 @@ VENV=".venv"
 STAMP="$VENV/.deps.sha"
 
 if [ ! -d "$VENV" ]; then
-  echo "[engineer] creating local venv with $PY"
+  echo "[engineer] creating local venv with $PY" >&2
   "$PY" -m venv "$VENV"
 fi
 
 WANT="$(shasum -a 256 requirements.txt | cut -d' ' -f1)"
 HAVE="$(cat "$STAMP" 2>/dev/null || true)"
 if [ "$WANT" != "$HAVE" ]; then
-  echo "[engineer] installing dependencies locally"
+  echo "[engineer] installing dependencies locally" >&2
   "$VENV/bin/python" -m pip install -q --upgrade pip
   "$VENV/bin/python" -m pip install -q -r requirements.txt
   echo "$WANT" > "$STAMP"
@@ -43,12 +43,13 @@ case "${1:-}" in
     shift || true ;;
   --test)  shift
            "$VENV/bin/python" tests/test_smoke.py "$@" || exit 1
-           exec "$VENV/bin/python" tests/test_rules.py ;;
+           "$VENV/bin/python" tests/test_rules.py      || exit 1
+           exec "$VENV/bin/python" tests/test_analysis.py ;;
 esac
 
 if [ ! -f .env ]; then
   cp .env.example .env
-  echo "[engineer] .env created — put your JEV_API_KEY in it, then run again"
+  echo "[engineer] .env created — put your JEV_API_KEY in it, then run again" >&2
 fi
 
 echo $$ > "$PIDFILE"

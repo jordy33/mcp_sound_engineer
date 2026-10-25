@@ -12,6 +12,8 @@ Product rules that are NOT in the source are marked "PRODUCT RULE" where they ap
 from __future__ import annotations
 
 import math
+import os
+import re
 
 RULES_VERSION = "2.0.0"
 RECIPE_SCHEMA_VERSION = "2.0.0"
@@ -27,6 +29,8 @@ GATE = {
     "max_limiter_gr_db": 4.0,
     "max_gain_reduction_db": 3.0,
     "min_gain_reduction_db": 1.0,
+    "max_total_gain_reduction_db": 6.0,   # conservative end of the 6-8 dB source range
+    "min_mono_cancel_db": -6.0,
 }
 
 # Which GATE constants are actually enforced by code (tests assert completeness).
@@ -34,6 +38,7 @@ IMPLEMENTED_GATES = {
     "max_corrective_db_per_point", "max_cumulative_corrective_db",
     "min_phase_correlation", "max_limiter_gr_db", "max_gain_reduction_db",
     "min_gain_reduction_db", "noise_floor_moderate_db", "lossy_shelf_drop_db",
+    "max_total_gain_reduction_db", "min_mono_cancel_db",
 }
 UNIMPLEMENTED_GATES = {"noise_floor_minor_db"}
 
@@ -88,6 +93,7 @@ ACTIONS = {
     "send_back":     "stop: the mix needs work before mastering",
 }
 TARGETS = {"master", "mix_bus", "vocal", "drums", "bass", "bus", "stem"}
+BAND_CENTERS = {"sub": 40, "bass": 150, "low_mid": 375, "mid": 1250, "high_mid": 4000, "high": 10000}
 
 # --- Question schemas: the single source of truth for answer keys ------------
 MASTER_QUESTIONS = {
@@ -139,11 +145,18 @@ def loudness_target(platform: str) -> dict:
     return PLATFORMS[key]
 
 
+FIELD = {"noul": "noul", "score": "score", "choice": "choice"}
+
+
 def require(answers: dict, questions: dict) -> None:
-    """Fail loud when a recipe reads a key the schema never produces."""
+    """Fail loud when an answer is missing, or present without the field its type needs."""
     missing = [k for k in questions if k not in answers]
     if missing:
         raise ValueError(f"answers missing {missing}; schema defines {sorted(questions)}")
+    malformed = [f"{k}.{FIELD[q['type']]}" for k, q in questions.items()
+                 if FIELD[q["type"]] not in answers[k]]
+    if malformed:
+        raise ValueError(f"answers without the expected field: {malformed}")
 
 
 def _noul(answers, name, default=0.0):
@@ -220,6 +233,13 @@ def loudness_warnings(facts: dict, target: dict) -> list[str]:
     ceiling = target["true_peak_ceiling"]
     if tp > ceiling + 0.05:
         out.append(f"true peak {tp} dBTP is above the {ceiling} dBTP ceiling for this destination")
+    stereo = facts.get("stereo") or {}
+    cancel = stereo.get("mono_cancel_db")
+    if cancel is not None and float(cancel) < GATE["min_mono_cancel_db"]:
+        out.append(f"mono fold-down loses {abs(cancel)} dB; check phase before the chain")
+    floor = (facts.get("noise") or {}).get("floor_dbfs")
+    if floor is not None and GATE["noise_floor_minor_db"] < float(floor) <= GATE["noise_floor_moderate_db"]:
+        out.append(f"noise floor {floor} dBFS is minor but audible on quiet passages")
     ref = target.get("normalization_lufs")
     if ref is not None and lufs > ref + 6:
         out.append(f"{round(lufs - ref, 1)} dB hotter than the {ref} LUFS playback reference — "
@@ -229,6 +249,13 @@ def loudness_warnings(facts: dict, target: dict) -> list[str]:
 
 def expected_limiter_gr(facts: dict, target: dict) -> float:
     """Arithmetic, not a model opinion: how far the master is above the playback reference."""
+    stereo = facts.get("stereo") or {}
+    cancel = stereo.get("mono_cancel_db")
+    if cancel is not None and float(cancel) < GATE["min_mono_cancel_db"]:
+        out.append(f"mono fold-down loses {abs(cancel)} dB; check phase before the chain")
+    floor = (facts.get("noise") or {}).get("floor_dbfs")
+    if floor is not None and GATE["noise_floor_minor_db"] < float(floor) <= GATE["noise_floor_moderate_db"]:
+        out.append(f"noise floor {floor} dBFS is minor but audible on quiet passages")
     ref = target.get("normalization_lufs")
     lufs = float((facts.get("loudness") or {}).get("integrated_lufs", ref or 0.0))
     if ref is None:
@@ -248,10 +275,15 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
 
     # Corrective moves: over the cap is a send-back, never a silent clamp.
     total = 0.0
-    for band, freq in (("low_end", 300), ("high_mid", 3000)):
+    reference = REFERENCE_CURVE
+    for band, group in (("low_end", ("sub", "bass", "low_mid")), ("high_mid", ("mid", "high_mid"))):
         level = _score(answers, band)
         if level < 2.5:
             continue
+        measured = facts.get("spectral", {}).get("bands_db_rel", {}) if facts else {}
+        excess = {b: float(measured.get(b, reference[b])) - reference[b] for b in group}
+        worst = max(excess, key=excess.get)
+        freq = BAND_CENTERS[worst]
         needed = (level - 2.0) * 2.0   # level 4 (extreme) demands 4 dB -> send back
         if needed > GATE["max_corrective_db_per_point"]:
             return [_action("send_back",
@@ -261,7 +293,7 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
             return [_action("send_back",
                             reasons=[f"corrective_beyond_cap:cumulative:{round(total, 1)}dB"])]
         recipe.append(_action("eq.bell", freq_hz=freq, gain_db=-round(needed, 1), q=4.0,
-                              role="corrective", measured_from=band))
+                              role="corrective", measured_from=band, band=worst))
 
     # Dynamics before sibilance: the de-esser belongs to the dynamic stage, after compression.
     if _choice(answers, "dynamics") == "glue":
@@ -272,6 +304,12 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
     elif _choice(answers, "dynamics") == "expand":
         recipe.append(_action("compressor", target="master", mode="upward_expand",
                               reason="restore range on over-compressed material"))
+
+    total_gr = sum(a.get("gain_reduction_db", 0.0) for a in recipe if a["action"] == "compressor")
+    total_gr += expected_limiter_gr(facts, target)
+    if total_gr > GATE["max_total_gain_reduction_db"]:
+        return [_action("send_back",
+                        reasons=[f"gain_reduction_budget:{round(total_gr, 1)}dB"])]
 
     sib = _choice(answers, "sibilance")
     if sib == "deess":
@@ -287,8 +325,10 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
     recipe.append(_action("limiter", ceiling_dbtp=target["true_peak_ceiling"],
                           expected_gain_reduction_db=expected_limiter_gr(facts, target)))
 
-    # Dither belongs to the destination, never to the model: only when reducing bits.
-    if target["dither"] != "none":
+    # Dither belongs to the destination, and only when bits are actually reduced.
+    source_bits = facts.get("bit_depth")
+    reducing = source_bits is None or target["bit_depth"] < int(source_bits)
+    if target["dither"] != "none" and reducing:
         recipe.append(_action("dither", bit_depth=target["bit_depth"], type=target["dither"]))
     return recipe
 
@@ -351,7 +391,7 @@ def mix_warnings(answers: dict, stems: list[str]) -> list[str]:
     return out
 
 
-def build_mix_recipe(answers: dict, stems: list[str]) -> list[dict]:
+def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | None = None) -> list[dict]:
     """Mix decisions. PRODUCT DEFAULTS: not sourced from the mastering methodology."""
     require(answers, MIX_QUESTIONS)
     recipe: list[dict] = []
@@ -370,15 +410,33 @@ def build_mix_recipe(answers: dict, stems: list[str]) -> list[dict]:
     if masking >= 2.5:
         recipe.append(_action("eq.bell", target="bus", freq_hz=300,
                               gain_db=-clamp(masking - 2.0, 0.0, 3.0), q=4.0, role="corrective"))
+    for stem in stem_facts or []:
+        if float(stem.get("low_correlation", 1.0)) < GATE["min_phase_correlation"]:
+            recipe.append(_action("stereo.width", target="bus", mono_below_hz=120,
+                                  stem=stem["path"], reason="mono bass"))
     if _choice(answers, "bus_comp") == "glue":
         recipe.append(_action("compressor", target="mix_bus", ratio=2.0, attack_ms=30,
                               release_ms=250, gain_reduction_db=2.0))
     return recipe
 
 
+STEM_SYNONYMS = {
+    "vocal": ("vocal", "vox", "voice", "voz", "lead_vox", "ld"),
+    "drums": ("drum", "kick", "snare", "hat", "oh", "overhead", "perc", "loop", "beat", "kit"),
+    "bass": ("bass", "sub", "808", "kick_sub"),
+}
+
+
 def _match_stem(stems: list[str], role: str) -> str | None:
-    """Map a role to an actual exported stem by name; no invented targets."""
+    """Match a role against the file's basename only, using explicit synonyms.
+
+    The old version searched the whole path: '/Bounces/Vocals_Session/02_drums.wav'
+    contains 'vocal' and was taken as the vocal.
+    """
+    hints = STEM_SYNONYMS.get(role, (role,))
     for path in stems or []:
-        if role in path.lower():
+        stem = os.path.splitext(os.path.basename(path))[0].lower()
+        tokens = re.split(r"[^a-z0-9]+", stem)
+        if any(h in tokens or h in stem for h in hints):
             return path
     return None

@@ -12,8 +12,9 @@ those numbers, which means:
 * it cannot prefer one take over another;
 * it cannot be surprised. If the measurement does not capture a problem, the problem does not exist.
 
-Not implemented yet: correlation drop **after** the chain (needs a before/after file), per-section
-analysis, and reference-track deviation (the reference curve is a constant).
+Not implemented yet: denoise, dynamic EQ, tonal shelves, and an adapter that applies the recipe
+to a real session. Per-section analysis, reference-track deviation and the correlation drop after
+the chain **are** implemented (`analyze_sections`, `analyze_reference`, `judge_master.previous_path`).
 
 ## Measurement approximations
 

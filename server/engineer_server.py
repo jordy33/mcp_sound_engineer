@@ -19,7 +19,7 @@ except ImportError:  # executed as a script: python server/engineer_server.py
     from jev import JevError, ask, config
 
 SERVER_NAME = "mcp_sound_engineer"
-SERVER_VERSION = "0.1.0"
+SERVER_VERSION = "0.4.0"
 
 # Jev schemas live in rules.py: one source of truth for the answer keys.
 MASTER_QUESTIONS = rules.MASTER_QUESTIONS
@@ -61,6 +61,14 @@ def tool_judge_master(path: str, platform: str = "spotify",
         reference_curve = measured["reference_curve"]
     else:
         measured, reference_curve = None, rules.REFERENCE_CURVE
+    gates = rules.evaluate_gates(facts)
+    if gates["send_back"]:
+        # Measured refusals must not depend on a network call or a key.
+        return {"facts": facts, "answers": {}, "gates": gates,
+                "recipe": [rules._action("send_back", reasons=gates["reasons"])],
+                "target": target, "reference": measured,
+                "warnings": rules.loudness_warnings(facts, target)}
+
     state = {
         "context": {"stage": "mastering", "platform": platform,
                     "playback_normalization_lufs": target["normalization_lufs"],
@@ -93,7 +101,7 @@ def tool_judge_mix(paths: list[str]) -> dict:
     warnings = rules.mix_warnings(answers, names)
     warnings += [f"{g['gate']}: {g}" for g in facts.get("gates", [])]
     return {"facts": facts, "answers": answers,
-            "recipe": rules.build_mix_recipe(answers, names),
+            "recipe": rules.build_mix_recipe(answers, names, facts["stems"]),
             "warnings": warnings}
 
 

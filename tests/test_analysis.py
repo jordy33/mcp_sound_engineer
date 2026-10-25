@@ -29,6 +29,19 @@ def _wav(samples: np.ndarray, sr: int = SR, name: str = "t.wav") -> str:
     return path
 
 
+def _wav24(samples: np.ndarray, sr: int = SR) -> str:
+    """Write 24-bit PCM, which is what a Logic bounce defaults to."""
+    path = os.path.join(tempfile.mkdtemp(), "t24.wav")
+    data = np.atleast_2d(samples.T).T if samples.ndim > 1 else samples.reshape(-1, 1)
+    values = (np.clip(data, -1, 1) * 8388607).astype(np.int32)
+    raw = np.stack([values & 0xFF, (values >> 8) & 0xFF, (values >> 16) & 0xFF],
+                   axis=-1).astype(np.uint8).tobytes()
+    with wave.open(path, "wb") as w:
+        w.setnchannels(data.shape[1]); w.setsampwidth(3); w.setframerate(sr)
+        w.writeframes(raw)
+    return path
+
+
 def _sine(freq, amp, seconds=3.0, sr=SR):
     t = np.arange(int(seconds * sr)) / sr
     return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float64)
@@ -55,6 +68,51 @@ def test_lufs_of_997hz_at_minus_20_dbfs():
     amp = 0.1 * np.sqrt(2)          # RMS = -20 dBFS
     lufs = analysis.integrated_lufs(_sine(997, amp), SR)
     assert abs(lufs - (-20.0)) < 1.0, lufs
+
+
+def test_lufs_sums_channel_power():
+    """Uncorrelated L/R must read ~6 dB above the same signal averaged to mono."""
+    rng = np.random.default_rng(4)
+    left = 0.05 * rng.normal(size=SR * 4)
+    right = 0.05 * rng.normal(size=SR * 4)
+    stereo = analysis.integrated_lufs(np.stack([left, right], axis=1), SR)
+    mono = analysis.integrated_lufs(((left + right) / 2).reshape(-1, 1), SR)
+    assert abs((stereo - mono) - 6.0) < 1.0, (stereo, mono)
+
+
+def test_lufs_survives_out_of_phase_channels():
+    rng = np.random.default_rng(5)
+    left = 0.05 * rng.normal(size=SR * 4)
+    lufs = analysis.integrated_lufs(np.stack([left, -left], axis=1), SR)
+    assert lufs > -30, lufs          # the old mono average read silence here
+
+
+def test_true_peak_is_accurate_on_a_pure_tone():
+    tone = _sine(997, 0.5)
+    tp = analysis.true_peak_dbtp(tone, SR)
+    assert abs(tp - (-6.02)) < 0.1, tp
+
+
+def test_true_peak_sees_a_hard_panned_channel():
+    t = np.arange(SR * 2) / SR
+    stereo = np.zeros((len(t), 2))
+    stereo[:, 0] = 0.9 * np.sin(2 * np.pi * 440 * t)     # -0.92 dBFS in L only
+    assert analysis.true_peak_dbtp(stereo, SR) > -1.5, analysis.true_peak_dbtp(stereo, SR)
+
+
+def test_24_bit_wav_is_read_at_the_right_level():
+    tone = _sine(1000, 0.5)
+    path = _wav24(tone)
+    facts = analysis.analyze_master(path)
+    assert facts["bit_depth"] == 24
+    assert abs(facts["loudness"]["sample_peak_dbfs"] - (-6.02)) < 0.1, facts["loudness"]
+
+
+def test_mono_cancel_is_reported():
+    t = np.arange(SR * 2) / SR
+    tone = 0.3 * np.sin(2 * np.pi * 300 * t)
+    stereo = np.stack([tone, -tone], axis=1)
+    assert analysis.mono_cancel_db(stereo) < -40
 
 
 def test_band_energy_is_localized():
@@ -165,15 +223,23 @@ def test_stem_gate_mono_bass():
 
 
 def test_sections_flag_a_hot_window():
+    t = np.arange(SR * 24) / SR
+    quiet = 0.05 * np.sin(2 * np.pi * 220 * t[: SR * 6])
+    loud = 0.9 * np.sin(2 * np.pi * 220 * t[: SR * 6])
+    signal = np.concatenate([quiet, quiet, quiet, loud])
+    facts = analysis.analyze_sections(_wav(signal), window_s=6.0)
+    assert facts["reliable"] is True
+    assert len(facts["flagged_windows"]) == 1, facts["flagged_windows"]
+    assert facts["flagged_windows"] == [18.0], facts["flagged_windows"]
+
+
+def test_sections_refuses_to_flag_two_windows():
     t = np.arange(SR * 12) / SR
     quiet = 0.05 * np.sin(2 * np.pi * 220 * t[: SR * 6])
     loud = 0.9 * np.sin(2 * np.pi * 220 * t[: SR * 6])
     facts = analysis.analyze_sections(_wav(np.concatenate([quiet, loud])), window_s=6.0)
-    assert len(facts["windows"]) == 2
-    assert facts["flagged_windows"], facts
-    assert len(facts["flagged_windows"]) < len(facts["windows"]), facts["flagged_windows"]
-    lufs = [w["integrated_lufs"] for w in facts["windows"]]
-    assert max(lufs) - min(lufs) > 10, lufs
+    assert facts["reliable"] is False
+    assert facts["flagged_windows"] == []
 
 
 def test_reference_curve_is_measurable():

@@ -260,6 +260,59 @@ def test_correlation_drop_detects_image_loss():
     assert rules.correlation_drop(before, {"stereo": {"phase_correlation": 0.85}})["exceeds"] is False
 
 
+def test_stem_matching_uses_basename_not_path():
+    path = "/Bounces/Vocals_Session/02_drums.wav"
+    assert rules._match_stem([path], "drums") == path
+    assert rules._match_stem([path], "vocal") is None
+    assert rules._match_stem(["Lead Guitar.wav"], "vocal") is None
+    assert rules._match_stem(["01_Kick.wav"], "drums") == "01_Kick.wav"
+
+
+def test_require_rejects_missing_field():
+    answers = _answers()
+    del answers["low_end"]["score"]
+    try:
+        rules.build_master_recipe(answers, {}, "spotify")
+    except ValueError as exc:
+        assert "low_end.score" in str(exc), exc
+    else:
+        raise AssertionError("a score answer without 'score' must not default to 0")
+
+
+def test_gain_reduction_budget_sends_back():
+    facts = {"loudness": {"integrated_lufs": -8.0, "true_peak_dbtp": -0.5,
+                          "loudness_range_lu": 9.0},
+             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
+             "duration_seconds": 60, "sample_rate": 44100}
+    recipe = rules.build_master_recipe(
+        _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 4.0}), facts, "spotify")
+    assert recipe[0]["action"] == "send_back"
+    assert any("gain_reduction_budget" in r for r in recipe[0]["reasons"]), recipe[0]
+
+
+def test_dither_skipped_when_bits_are_not_reduced():
+    already_16 = {"bit_depth": 16}
+    assert all(a["action"] != "dither"
+               for a in rules.build_master_recipe(_answers(), already_16, "cd"))
+    assert rules.build_master_recipe(_answers(), {"bit_depth": 24}, "cd")[-1]["action"] == "dither"
+
+
+def test_corrective_uses_the_measured_band():
+    facts = {"spectral": {"bands_db_rel": {"sub": -50.0, "bass": 0.0, "low_mid": -45.0,
+                                            "mid": -40.0, "high_mid": -45.0, "high": -50.0}}}
+    recipe = rules.build_master_recipe(_answers(low_end={"score": 3.0}), facts, "spotify")
+    bell = next(a for a in recipe if a["action"] == "eq.bell")
+    assert bell["freq_hz"] == rules.BAND_CENTERS["bass"], bell
+    assert bell["band"] == "bass"
+
+
+def test_mono_compatibility_warning():
+    facts = {"stereo": {"mono_cancel_db": -30.0}, "loudness": {"integrated_lufs": -14.0,
+                                                               "true_peak_dbtp": -1.2}}
+    warnings = rules.loudness_warnings(facts, rules.PLATFORMS["spotify"])
+    assert any("mono fold-down" in w for w in warnings), warnings
+
+
 def test_action_rejects_unknown_target():
     try:
         rules._action("limiter", target="monitor")

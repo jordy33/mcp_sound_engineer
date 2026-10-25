@@ -31,18 +31,45 @@ BANDS = {
 
 
 def load(path: str) -> tuple[np.ndarray, int]:
-    """Return (samples[frames, channels] float32 in [-1,1], sample_rate)."""
+    """Return (samples[frames, channels] float32 in [-1,1], sample_rate).
+
+    Reads 8/16/24/32-bit integer WAV and defers float WAV to soundfile. A Logic
+    bounce is 24-bit by default, so assuming 16-bit silently produced garbage.
+    """
     if not os.path.isfile(path):
         raise FileNotFoundError(f"audio file not found: {path}")
+
     if path.lower().endswith(".wav"):
-        with wave.open(path) as w:
-            sr, ch, n = w.getframerate(), w.getnchannels(), w.getnframes()
-            raw = np.frombuffer(w.readframes(n), dtype="<i2").astype(np.float32) / 32768.0
-        return raw.reshape(-1, ch), sr
+        try:
+            with wave.open(path) as w:
+                sr, ch, n, width = (w.getframerate(), w.getnchannels(),
+                                    w.getnframes(), w.getsampwidth())
+                raw = w.readframes(n)
+        except wave.Error:
+            return _load_via_soundfile(path)
+        if width == 2:
+            x = np.frombuffer(raw, "<i2").astype(np.float32) / 32768.0
+        elif width == 3:
+            b = np.frombuffer(raw, np.uint8).reshape(-1, 3).astype(np.int32)
+            v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+            v = np.where(v & 0x800000, v - 0x1000000, v)
+            x = v.astype(np.float32) / 8388608.0
+        elif width == 4:
+            x = np.frombuffer(raw, "<i4").astype(np.float32) / 2147483648.0
+        elif width == 1:
+            x = (np.frombuffer(raw, np.uint8).astype(np.float32) - 128.0) / 128.0
+        else:
+            raise ValueError(f"unsupported WAV sample width: {width} bytes")
+        return x.reshape(-1, ch), sr
+
+    return _load_via_soundfile(path)
+
+
+def _load_via_soundfile(path: str) -> tuple[np.ndarray, int]:
     try:
-        import soundfile as sf  # optional
+        import soundfile as sf
     except ImportError as exc:  # pragma: no cover
-        raise RuntimeError("install soundfile to read this format") from exc
+        raise RuntimeError("install soundfile to read this format (float WAV, FLAC, OGG, AIFF)") from exc
     data, sr = sf.read(path, dtype="float32", always_2d=True)
     return data, sr
 
@@ -59,33 +86,38 @@ def bands_db_rel(mono: np.ndarray, sr: int) -> dict[str, float]:
             for name, (lo, hi) in BANDS.items()}
 
 
-def integrated_lufs(mono: np.ndarray, sr: int) -> float:
-    """BS.1770 integrated loudness: K-weighting + 400 ms gating (absolute and relative).
+def integrated_lufs(data, sr: int) -> float:
+    """BS.1770 integrated loudness, summed across channels.
 
-    The gating matters: without it, silence and quiet intros drag the number down and
-    the same master reads differently depending on how much air it has at the edges.
+    Channel powers add (L^2 + R^2), they do not average: averaging a stereo signal
+    under-reports by ~3 LU, and a hard out-of-phase pair reads silence.
     """
+    x = np.atleast_2d(data if data.ndim > 1 else data.reshape(-1, 1))
     try:
         import pyloudnorm as pyln  # exact, optional
-        return round(float(pyln.Meter(sr).integrated_loudness(mono)), 2)
+        return round(float(pyln.Meter(sr).integrated_loudness(x)), 2)
     except Exception:
         pass
 
-    y = _k_weighted(mono, sr)
+    n = x.shape[0]
     block = int(0.4 * sr)
-    if len(y) < block:
-        return round(-0.691 + 10 * np.log10(float(np.mean(y ** 2)) + 1e-20), 2)
-
     step = max(1, block // 4)
-    starts = range(0, len(y) - block + 1, step)
-    powers = np.array([float(np.mean(y[i:i + block] ** 2)) for i in starts]) + 1e-20
+    if n < block:
+        powers = [float(np.sum(np.mean(_k_weighted(x[:, c], sr) ** 2)))
+                  for c in range(x.shape[1])]
+        return round(-0.691 + 10 * np.log10(sum(powers) + 1e-20), 2)
+
+    weighted = [_k_weighted(x[:, c], sr) for c in range(x.shape[1])]
+    starts = range(0, n - block + 1, step)
+    powers = np.array([sum(float(np.mean(w[i:i + block] ** 2)) for w in weighted)
+                       for i in starts]) + 1e-20
     block_lufs = -0.691 + 10 * np.log10(powers)
 
-    gated = powers[block_lufs > -70.0]                      # absolute gate
+    gated = powers[block_lufs > -70.0]
     if gated.size == 0:
         return -70.0
     relative = -0.691 + 10 * np.log10(float(np.mean(gated))) - 10.0
-    keep = gated[(-0.691 + 10 * np.log10(gated)) > relative]  # relative gate
+    keep = gated[(-0.691 + 10 * np.log10(gated)) > relative]
     if keep.size == 0:
         keep = gated
     return round(-0.691 + 10 * np.log10(float(np.mean(keep))), 2)
@@ -110,18 +142,31 @@ def _k_weighted(mono: np.ndarray, sr: int) -> np.ndarray:
     return np.fft.irfft(spec * h, n=n)
 
 
-def true_peak_dbtp(mono: np.ndarray, sr: int, oversample: int = 4) -> float:
-    """4x oversampled peak via FFT zero-padding, processed in chunks."""
-    peak = 0.0
-    chunk = 1 << 17
-    for start in range(0, len(mono), chunk):
-        seg = mono[start:start + chunk]
-        if len(seg) < 16:
+def _oversampled(x: np.ndarray, oversample: int) -> np.ndarray:
+    spec = np.fft.rfft(x)
+    return np.fft.irfft(spec, n=len(x) * oversample) * oversample
+
+
+def true_peak_dbtp(data, sr: int, oversample: int = 4) -> float:
+    """Inter-sample peak per channel (BS.1770 4x), with block edges discarded.
+
+    Zero-padding in the frequency domain creates boundary ringing; taking only the
+    middle of each overlapped block keeps the estimate honest (a pure tone used to
+    read +1.2 dB high).
+    """
+    x = np.atleast_2d(data if data.ndim > 1 else data.reshape(-1, 1)).astype(np.float64)
+    block, peak = 8192, 0.0
+    for c in range(x.shape[1]):
+        ch = x[:, c]
+        if len(ch) <= block:
+            up = _oversampled(np.pad(ch, (0, block - len(ch))), oversample)
+            peak = max(peak, float(np.max(np.abs(up[: max(1, len(ch) * oversample)]))))
             continue
-        n = len(seg)
-        spec = np.fft.rfft(seg)
-        up = np.fft.irfft(spec, n=n * oversample) * oversample
-        peak = max(peak, float(np.max(np.abs(up))))
+        edge = block // 4 * oversample
+        for i in range(0, len(ch) - block + 1, block // 2):
+            up = _oversampled(ch[i:i + block], oversample)
+            middle = up[edge:len(up) - edge]
+            peak = max(peak, float(np.max(np.abs(middle))))
     return round(20 * np.log10(peak + 1e-12), 2)
 
 
@@ -147,6 +192,17 @@ def stereo_correlation(stereo: np.ndarray) -> float:
     if denom < 1e-9:
         return 1.0
     return round(float(np.corrcoef(l, r)[0, 1]), 3)
+
+
+def mono_cancel_db(stereo: np.ndarray) -> float:
+    """How much level survives a mono fold-down, in dB. -inf means it cancels."""
+    if stereo.ndim != 2 or stereo.shape[1] < 2:
+        return 0.0
+    mid = stereo.mean(axis=1)
+    worst = max(float(np.sqrt(np.mean(stereo[:, c] ** 2))) for c in range(stereo.shape[1]))
+    if worst < 1e-9:
+        return 0.0
+    return round(float(20 * np.log10(float(np.sqrt(np.mean(mid ** 2))) / worst + 1e-12)), 1)
 
 
 def clipping(stereo: np.ndarray, thr: float = 0.999) -> dict:
@@ -204,10 +260,11 @@ def analyze_master(path: str) -> dict:
         "sample_rate": sr,
         "channels": int(data.shape[1]) if data.ndim == 2 else 1,
         "duration_seconds": round(len(mono) / sr, 2),
+        "bit_depth": _wav_bit_depth(path),
         "loudness": {
-            "integrated_lufs": integrated_lufs(mono, sr),
+            "integrated_lufs": integrated_lufs(data, sr),
             "loudness_range_lu": loudness_range(mono, sr),
-            "true_peak_dbtp": true_peak_dbtp(mono, sr),
+            "true_peak_dbtp": true_peak_dbtp(data, sr),
             "sample_peak_dbfs": round(20 * np.log10(peak + 1e-12), 2),
             "crest_db": round(20 * np.log10(peak / rms + 1e-12), 2),
         },
@@ -215,12 +272,23 @@ def analyze_master(path: str) -> dict:
             "bands_db_rel": bands_db_rel(mono, sr),
             "centroid_hz": _centroid(mono, sr),
         },
-        "stereo": {"phase_correlation": stereo_correlation(data)},
+        "stereo": {"phase_correlation": stereo_correlation(data),
+                    "mono_cancel_db": mono_cancel_db(data)},
         "clipping": clipping(data),
         "noise": {"floor_dbfs": noise_floor_dbfs(mono, sr)},
         "bandwidth": spectral_cutoff(mono, sr),
     }
     return plain(stats)
+
+
+def _wav_bit_depth(path: str) -> int | None:
+    if not path.lower().endswith(".wav"):
+        return None
+    try:
+        with wave.open(path) as w:
+            return w.getsampwidth() * 8
+    except wave.Error:
+        return None
 
 
 def _centroid(mono: np.ndarray, sr: int) -> int:
@@ -267,7 +335,7 @@ def analyze_sections(path: str, window_s: float = 30.0) -> dict:
     mono = _mono(data)
     win = int(window_s * sr)
     if len(mono) < win:
-        return {"window_s": window_s, "windows": [],
+        return {"window_s": window_s, "windows": [], "reliable": False,
                 "note": "file shorter than one window; use analyze_master"}
     windows = []
     for start in range(0, len(mono) - win + 1, win):
@@ -287,7 +355,11 @@ def analyze_sections(path: str, window_s: float = 30.0) -> dict:
         w["tilt_delta"] = round(t - median_tilt, 1)
         # A single robust criterion: loudness or spectral tilt moving away from the file median.
         w["flagged"] = abs(w["lufs_delta"]) > 3.0 or abs(w["tilt_delta"]) > 3.0
-    return plain({"window_s": window_s, "windows": windows,
+    reliable = len(windows) >= 3
+    if not reliable:                      # a median of two points is degenerate
+        for w in windows:
+            w["flagged"] = False
+    return plain({"window_s": window_s, "windows": windows, "reliable": reliable,
                   "median_lufs": round(median_lufs, 2),
                   "median_bands_db_rel": {k: round(v, 1) for k, v in median_bands.items()},
                   "median_tilt": round(median_tilt, 1),
@@ -320,7 +392,7 @@ def analyze_stems(paths: list[str]) -> dict:
                   "gates": stem_gates(stems)})
 
 
-VOCAL_HINTS = ("vocal", "vox", "voice", "lead", "voz")
+VOCAL_HINTS = ("vocal", "vox", "voice", "voz")
 
 
 def stem_gates(stems: list[dict]) -> list[dict]:
