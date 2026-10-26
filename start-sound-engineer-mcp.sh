@@ -42,10 +42,30 @@ case "${1:-}" in
     if is_running; then kill "$(cat "$PIDFILE")" 2>/dev/null; sleep 1; rm -f "$PIDFILE"; fi
     shift || true ;;
   --test)  shift
-           "$VENV/bin/python" tests/test_smoke.py "$@" || exit 1
-           "$VENV/bin/python" tests/test_rules.py      || exit 1
-           "$VENV/bin/python" tests/test_analysis.py   || exit 1
-           exec "$VENV/bin/python" tests/test_adapter.py ;;
+           set -o pipefail
+           OUT="$(mktemp)"
+           trap 'rm -f "$OUT"' EXIT
+           FAILED=0
+           for f in tests/test_*.py; do
+             echo "[engineer] $f" >&2
+             if [ "$f" = "tests/test_smoke.py" ]; then
+               "$VENV/bin/python" "$f" "$@" 2>&1 | tee -a "$OUT" || FAILED=1
+             else
+               "$VENV/bin/python" "$f" 2>&1 | tee -a "$OUT" || FAILED=1
+             fi
+           done
+           RAN="$(grep -c '^  ok  ' "$OUT" || true)"
+           DEFINED="$(grep -h '^def test_' tests/test_*.py | wc -l | tr -d ' ')"
+           if [ "$RAN" -ne "$DEFINED" ]; then
+             echo "[engineer] test count mismatch: defined=$DEFINED executed=$RAN" >&2
+             exit 1
+           fi
+           if [ "$FAILED" -ne 0 ]; then
+             echo "[engineer] test failure(s) above" >&2
+             exit 1
+           fi
+           echo "[engineer] $RAN tests passed" >&2
+           exit 0 ;;
 esac
 
 if [ ! -f .env ]; then

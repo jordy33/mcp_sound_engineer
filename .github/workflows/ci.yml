@@ -21,13 +21,17 @@ jobs:
         run: |
           python -m pip install --upgrade pip
           pip install numpy
-      - name: smoke (protocol + analysis)
-        run: python tests/test_smoke.py
-      - name: rules (domain behaviour)
-        run: python tests/test_rules.py
-      - name: analysis (known-answer signals)
-        run: python tests/test_analysis.py
-      - name: adapter (plan against a fake session)
-        run: python tests/test_adapter.py
+      - name: tests (glob, count-checked)
+        run: |
+          set -o pipefail
+          OUT="$(mktemp)"
+          for f in tests/test_*.py; do
+            echo "== $f"
+            python "$f" | tee -a "$OUT"
+          done
+          RAN="$(grep -c '^  ok  ' "$OUT" || true)"
+          DEFINED="$(grep -h '^def test_' tests/test_*.py | wc -l | tr -d ' ')"
+          echo "test functions: defined=$DEFINED executed=$RAN"
+          test "$RAN" -eq "$DEFINED"
       - name: installable
         run: pip install -e . && python -c "import server.rules as r; print(r.RULES_VERSION)"
