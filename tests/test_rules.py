@@ -1,4 +1,5 @@
 """Domain tests: they assert the RULE's behaviour, not the code's arithmetic."""
+import ast
 import os
 import sys
 
@@ -24,6 +25,19 @@ def _answers(**over):
     for k, v in over.items():
         base[k].update(v)
     return base
+
+
+def _master_facts(lufs: float = -18.0, tp: float = -1.0, **extra):
+    base = {"loudness": {"integrated_lufs": lufs, "true_peak_dbtp": tp,
+                         "loudness_range_lu": 9.0},
+            "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
+            "duration_seconds": 60, "sample_rate": 44100}
+    base.update(extra)
+    return base
+
+
+def _limiter(recipe):
+    return next(a for a in recipe if a.get("action") == "limiter")
 
 
 # --- destinations -----------------------------------------------------------
@@ -141,17 +155,123 @@ def test_cumulative_corrective_includes_the_sibilance_cut():
     assert any("cumulative" in r for r in recipe[0]["reasons"])
 
 
-# --- arithmetic instead of model opinion ------------------------------------
-def test_limiter_gr_is_computed_from_measured_lufs():
-    facts = {"loudness": {"integrated_lufs": -12.0, "true_peak_dbtp": -0.5,
-                          "loudness_range_lu": 9.0},
-             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
-             "duration_seconds": 60, "sample_rate": 44100}
-    lim = next(a for a in rules.build_master_recipe(_answers(), facts, "spotify")
-               if a["action"] == "limiter")
-    assert lim["expected_gain_reduction_db"] == 2.0, lim        # -12 vs -14 reference
-    assert lim["ceiling_dbtp"] == rules.PLATFORMS["spotify"]["true_peak_ceiling"]
+# --- limiter: two constraints, arithmetic instead of model opinion ----------
+def test_limiter_plan_case_1_loud_peak():
+    """Hot master: no gain is added; the peak alone needs 2 dB of reduction."""
+    plan = rules.plan_limiter(-10.0, 1.0, -1.0, desired_lufs=-14.0)
+    assert plan["input_gain_db"] == 0.0, plan
+    assert plan["expected_gain_reduction_db"] == 2.0, plan
+    assert plan["loudness_reached"] is True, plan
+    assert plan["approx_lufs_after"] == -10.0, plan
+    assert plan["plr_db"] == 11.0, plan
+
+
+def test_limiter_plan_case_2_loudness_not_reached():
+    """The peak cap stops the loudness request at 4 dB; the result is -16, not -14."""
+    plan = rules.plan_limiter(-20.0, -1.0, -1.0, desired_lufs=-14.0)
+    assert plan["input_gain_db"] == 4.0, plan
+    assert plan["expected_gain_reduction_db"] == 4.0, plan
+    assert plan["loudness_reached"] is False, plan
+    assert plan["approx_lufs_after"] == -16.0, plan
+    assert plan["plr_db"] == 19.0, plan
+
+
+def test_limiter_plan_case_3_small_move():
+    """A 0.5 dB loudness move only needs 0.5 dB of limiting."""
+    plan = rules.plan_limiter(-14.5, -1.0, -1.0, desired_lufs=-14.0)
+    assert plan["input_gain_db"] == 0.5, plan
+    assert plan["expected_gain_reduction_db"] == 0.5, plan
+    assert plan["loudness_reached"] is True, plan
+    assert plan["approx_lufs_after"] == -14.0, plan
+
+
+def test_limiter_default_is_peak_only():
+    plan = rules.plan_limiter(-12.0, -0.5, -1.0)
+    assert plan["input_gain_db"] == 0.0, plan
+    assert plan["expected_gain_reduction_db"] == 0.5, plan
+    assert plan["loudness_reached"] is True, plan
+
+
+def test_limiter_never_lowers_for_loudness():
+    plan = rules.plan_limiter(-10.0, -0.5, -1.0, desired_lufs=-14.0)
+    assert plan["input_gain_db"] == 0.0, plan
+    assert plan["expected_gain_reduction_db"] == 0.5, plan   # the peak still limits
+
+
+def test_limiter_no_limiting_reports_the_real_projection():
+    quiet = rules.plan_limiter(-20.0, -10.0, -1.0)
+    assert (quiet["input_gain_db"], quiet["expected_gain_reduction_db"]) == (0.0, 0.0)
+    assert quiet["approx_lufs_after"] == -20.0, quiet
+
+    asked = rules.plan_limiter(-20.0, -10.0, -1.0, desired_lufs=-14.0)
+    assert (asked["input_gain_db"], asked["expected_gain_reduction_db"]) == (6.0, 0.0)
+    assert asked["approx_lufs_after"] == -14.0, asked
+    assert asked["loudness_reached"] is True, asked
+
+
+def test_limiter_peak_at_or_below_ceiling_invents_no_gain():
+    at = rules.plan_limiter(-20.0, -1.0, -1.0)
+    below = rules.plan_limiter(-24.0, -2.0, -1.0)
+    for plan in (at, below):
+        assert plan["input_gain_db"] == 0.0, plan
+        assert plan["expected_gain_reduction_db"] == 0.0, plan
+
+
+def test_limiter_loudness_intent_capped_by_peak():
+    """6 dB asked; the peak budget allows 3.5 dB of input gain, not 4.5."""
+    plan = rules.plan_limiter(-18.0, -0.5, -1.0, desired_lufs=-12.0)
+    assert plan["input_gain_db"] == 3.5, plan
+    assert plan["expected_gain_reduction_db"] == 4.0, plan
+    assert plan["loudness_reached"] is False, plan
+    assert plan["approx_lufs_after"] == -14.5, plan
+    assert plan["plr_db"] == 17.5, plan
+
+
+def test_limiter_action_carries_the_contract_fields():
+    lim = _limiter(rules.build_master_recipe(_answers(), _master_facts(-18.0, -6.0),
+                                             "spotify", desired_lufs=-14.0))
+    assert lim["ceiling_dbtp"] == -1.0, lim
+    assert lim["input_gain_db"] == 4.0, lim
+    assert lim["expected_gain_reduction_db"] == 0.0, lim
+    assert lim["desired_lufs"] == -14.0, lim
+    assert lim["loudness_reached"] is True, lim
+    assert lim["approx_lufs_after"] == -14.0, lim
+    assert lim["plr_db"] == 12.0, lim
     assert "target_lufs" not in lim
+
+
+def test_limiter_action_survives_missing_measurements():
+    for facts in ({}, {"spectral": {"bands_db_rel": {}}},
+                  {"loudness": {"integrated_lufs": -18.0}}):
+        lim = _limiter(rules.build_master_recipe(_answers(), facts, "spotify"))
+        assert lim["input_gain_db"] == 0.0, (facts, lim)
+        assert lim["expected_gain_reduction_db"] == 0.0, (facts, lim)
+        assert lim["loudness_reached"] is True, (facts, lim)
+        assert lim["approx_lufs_after"] is None and lim["plr_db"] is None, (facts, lim)
+
+
+def test_limiter_trim_is_emitted():
+    recipe = rules.build_master_recipe(_answers(), _master_facts(-10.0, 5.0), "spotify")
+    lim = _limiter(recipe)
+    assert lim["input_gain_db"] == -2.0, lim
+    assert lim["expected_gain_reduction_db"] == 4.0, lim
+    warnings = rules.limiter_warnings(recipe)
+    assert any("input trim" in w for w in warnings), warnings
+    assert not any("not reached" in w for w in warnings), warnings
+
+
+def test_limiter_absurd_peak_sends_back():
+    recipe = rules.build_master_recipe(_answers(), _master_facts(-10.0, 7.0), "spotify")
+    assert recipe[0]["action"] == "send_back", recipe
+    assert any("peak_beyond_limiter" in r for r in recipe[0]["reasons"]), recipe[0]
+
+
+def test_limiter_no_name_error_with_mono_or_noise_facts():
+    facts = _master_facts(-18.0, -1.0,
+                          stereo={"phase_correlation": 0.9, "mono_cancel_db": -7.0},
+                          noise={"floor_dbfs": -55.0})
+    lim = _limiter(rules.build_master_recipe(_answers(), facts, "spotify"))
+    assert lim["ceiling_dbtp"] == -1.0, lim
 
 
 def test_dither_only_for_fixed_bit_depth_destinations():
@@ -259,6 +379,78 @@ def test_validate_recipe_accepts_a_good_recipe():
     assert rules.validate_recipe(good) == [], good
 
 
+def test_validate_recipe_requires_limiter_control_fields():
+    recipe = [{"action": "limiter", "target": "master",
+               "schema": rules.RECIPE_SCHEMA_VERSION}]
+    codes = {v["code"] for v in rules.validate_recipe(recipe)}
+    assert {"missing_limiter_ceiling", "missing_limiter_input_gain",
+            "missing_limiter_gr"} <= codes, codes
+
+
+def test_validate_recipe_rejects_absurd_input_trim():
+    recipe = [{"action": "limiter", "target": "master",
+               "schema": rules.RECIPE_SCHEMA_VERSION, "ceiling_dbtp": -1.0,
+               "input_gain_db": -4.0, "expected_gain_reduction_db": 0.0}]
+    assert "limiter_input_trim_cap" in {v["code"] for v in rules.validate_recipe(recipe)}
+
+
+def test_validate_recipe_rejects_ceiling_above_minus_one():
+    recipe = [{"action": "limiter", "target": "master",
+               "schema": rules.RECIPE_SCHEMA_VERSION, "ceiling_dbtp": 0.5,
+               "input_gain_db": 0.0, "expected_gain_reduction_db": 0.0}]
+    assert "limiter_ceiling" in {v["code"] for v in rules.validate_recipe(recipe)}
+
+
+def test_validate_recipe_rejects_non_numeric_limiter_fields():
+    recipe = [{"action": "limiter", "target": "master",
+               "schema": rules.RECIPE_SCHEMA_VERSION, "ceiling_dbtp": "x",
+               "input_gain_db": None, "expected_gain_reduction_db": []}]
+    violations = rules.validate_recipe(recipe)          # must not raise
+    invalid = [v for v in violations if v["code"] == "invalid_limiter_field"]
+    assert len(invalid) == 3, violations
+
+
+def test_no_duplicate_top_level_definitions():
+    for rel in ("server/rules.py", "server/engineer_server.py", "adapter/logic_adapter.py"):
+        with open(os.path.join(ROOT, rel), encoding="utf-8") as handle:
+            tree = ast.parse(handle.read())
+        names = [node.name for node in tree.body
+                 if isinstance(node, (ast.FunctionDef, ast.AsyncFunctionDef, ast.ClassDef))]
+        duplicates = sorted({name for name in names if names.count(name) > 1})
+        assert not duplicates, (rel, duplicates)
+
+
+def test_limiter_warning_for_unreached_loudness():
+    recipe = [{"action": "limiter", "target": "master",
+               "schema": rules.RECIPE_SCHEMA_VERSION, "ceiling_dbtp": -1.0,
+               "input_gain_db": 4.0, "expected_gain_reduction_db": 4.0,
+               "desired_lufs": -14.0, "loudness_reached": False,
+               "approx_lufs_after": -16.0, "plr_db": 19.0}]
+    warnings = rules.limiter_warnings(recipe)
+    assert any("not reached" in w and "PLR" in w for w in warnings), warnings
+
+
+def test_master_questions_have_no_limiter_question():
+    assert all("limiter" not in key.lower() for key in rules.MASTER_QUESTIONS)
+
+
+def test_noise_floor_minor_is_implemented():
+    warnings = rules.loudness_warnings({"noise": {"floor_dbfs": -55.0}},
+                                       rules.PLATFORMS["spotify"])
+    assert any("minor but audible" in w for w in warnings), warnings
+    assert "noise_floor_minor_db" in rules.IMPLEMENTED_GATES
+    assert "noise_floor_minor_db" not in rules.UNIMPLEMENTED_GATES
+
+
+def test_lossy_gate_uses_the_gate_constant():
+    over = {"bandwidth": {"drop_db": rules.GATE["lossy_shelf_drop_db"] + 0.5,
+                          "lossy_suspected": False}}
+    at = {"bandwidth": {"drop_db": rules.GATE["lossy_shelf_drop_db"],
+                        "lossy_suspected": False}}
+    assert "lossy_source:measured" in rules.evaluate_gates(over)["reasons"]
+    assert "lossy_source:measured" not in rules.evaluate_gates(at)["reasons"]
+
+
 def test_correlation_drop_detects_image_loss():
     before = {"stereo": {"phase_correlation": 0.9}}
     after = {"stereo": {"phase_correlation": 0.6}}
@@ -285,14 +477,22 @@ def test_require_rejects_missing_field():
         raise AssertionError("a score answer without 'score' must not default to 0")
 
 
-def test_gain_reduction_budget_sends_back():
-    facts = {"loudness": {"integrated_lufs": -8.0, "true_peak_dbtp": -0.5,
-                          "loudness_range_lu": 9.0},
-             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
-             "duration_seconds": 60, "sample_rate": 44100}
+def test_gain_reduction_budget_uses_peak_gr():
+    """The limiter's 4 dB come from the peak, not from -8 vs the -14 playback figure."""
+    facts = _master_facts(-8.0, 3.0)
     recipe = rules.build_master_recipe(
         _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 4.0}), facts, "spotify")
-    assert recipe[0]["action"] == "send_back"
+    assert recipe[0]["action"] == "send_back", recipe
+    assert any("gain_reduction_budget" in r for r in recipe[0]["reasons"]), recipe[0]
+
+
+def test_limiter_budget_with_desired_lufs():
+    """A loudness request reaches the peak cap: 4 dB limiter GR + 2.5 dB glue = 6.5."""
+    facts = _master_facts(-8.0, -0.5)
+    recipe = rules.build_master_recipe(
+        _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 4.0}),
+        facts, "spotify", desired_lufs=-2.0)
+    assert recipe[0]["action"] == "send_back", recipe
     assert any("gain_reduction_budget" in r for r in recipe[0]["reasons"]), recipe[0]
 
 
@@ -310,6 +510,35 @@ def test_corrective_uses_the_measured_band():
     bell = next(a for a in recipe if a["action"] == "eq.bell")
     assert bell["freq_hz"] == rules.BAND_CENTERS["bass"], bell
     assert bell["band"] == "bass"
+
+
+def test_corrective_uses_the_measured_reference_curve():
+    master = {"sub": -40.0, "bass": -5.0, "low_mid": -7.0,
+              "mid": -40.0, "high_mid": -40.0, "high": -40.0}
+    measured = {"sub": -20.0, "bass": -2.0, "low_mid": -13.0,
+                "mid": -10.0, "high_mid": -10.0, "high": -20.0}
+    facts = {"spectral": {"bands_db_rel": master}}
+    answers = _answers(low_end={"score": 3.0})
+
+    default_bell = next(a for a in rules.build_master_recipe(answers, facts, "spotify")
+                        if a["action"] == "eq.bell")
+    measured_bell = next(a for a in rules.build_master_recipe(
+        answers, facts, "spotify", reference_curve=measured) if a["action"] == "eq.bell")
+    assert default_bell["band"] == "bass", default_bell
+    assert measured_bell["band"] == "low_mid", measured_bell
+    assert measured_bell["freq_hz"] == rules.BAND_CENTERS["low_mid"], measured_bell
+
+
+def test_partial_reference_curve_fails_loud():
+    partial = dict(rules.REFERENCE_CURVE)
+    del partial["bass"]
+    for bad in ({}, partial):
+        try:
+            rules.build_master_recipe(_answers(), {}, "spotify", reference_curve=bad)
+        except ValueError as exc:
+            assert "bass" in str(exc), exc
+        else:
+            raise AssertionError("a partial reference curve must not be silently completed")
 
 
 def test_mono_compatibility_warning():

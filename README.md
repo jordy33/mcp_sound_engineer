@@ -14,7 +14,7 @@ It does not control any DAW. It is one of two independent MCPs:
 ```
 
 Two hats: **mixing** (N stems: balance, masking, corrective EQ) and **mastering** (one stereo file:
-send-back gates, dynamics, limiter, loudness target, dither).
+send-back gates, dynamics, limiter, playback-normalization reference, dither).
 
 ---
 
@@ -87,12 +87,12 @@ Register it in any MCP client, next to your DAW adapter — they are separate se
 
 | Tool | Input | Returns |
 |---|---|---|
-| `analyze_master` | one stereo file | LUFS, true peak, LRA, crest, phase correlation, 6 bands, centroid, clipping |
-| `analyze_stems` | N files | per-stem loudness, bands, low-band correlation, pairwise masking, and stem gates (buried vocal, outlier element, mono bass) |
+| `analyze_master` | one stereo file | LUFS, true peak, LRA, crest, phase correlation, 6 bands, 5–9 kHz sibilance, centroid, clipping |
+| `analyze_stems` | N files | per-stem loudness, bands, sibilance, low-band correlation, pairwise masking, and stem gates (buried vocal, outlier element, mono bass) |
 | `analyze_sections` | path + window | per-window LUFS/bands/correlation and which windows deviate from the median |
-| `analyze_reference` | path | a commercial reference's band balance, to feed `judge_master` |
-| `validate_recipe` | recipe | adapter-side contract check: caps, schema, terminal `send_back` |
-| `judge_master` | path, platform, optional `reference_path` / `previous_path` | `answers` + `recipe` + `warnings`; **measured gates run before the model**, so a refusal needs no key |
+| `analyze_reference` | path | a commercial reference's band balance and sibilance, to feed `judge_master` |
+| `validate_recipe` | recipe | adapter-side contract check: caps, schema, limiter control fields, terminal `send_back` |
+| `judge_master` | path, platform, optional `reference_path` / `previous_path` / `desired_lufs` | `answers` + `recipe` + `warnings`; `desired_lufs` is an optional loudness request, not a delivery target (omit it for peak-only limiting); **measured gates run before the model**, so a refusal needs no key |
 | `judge_mix` | stem paths | `answers` + `recipe` |
 | `engineer_info` | — | rules version, Jev status, platforms |
 
@@ -120,14 +120,16 @@ one source of truth for both the numbers and the answer keys.
 | Confidence | < 0.5 | `CONFIDENCE_MIN` | `confidence.needs_human` + warning; the recipe is a draft |
 | Broadband compression | 1.5–3:1, 10–30 ms, 1–3 dB GR | `CHAIN`, `GATE.min/max_gain_reduction_db` | emitted on the master bus |
 | De-esser | after compression | `CHAIN` | emitted after the compressor |
-| Limiter | ceiling from the destination, GR computed | `expected_limiter_gr` | arithmetic from measured LUFS, not a model score |
+| Limiter | GR = max(0, tp + input_gain − ceiling); ceiling from the destination | `plan_limiter` | input gain = min(loudness request, peak budget); `expected_gain_reduction_db` is a prediction, not a control |
+| Pre-limiter trim | ≤ 3 dB; more than 7 dB over the ceiling → `send_back` | `GATE.max_limiter_input_trim_db` | a peak that 4 dB GR + 3 dB input trim cannot fix is not a mastering problem |
 | Dither | only when the destination needs fewer bits than the source | `PLATFORMS[...]`, `facts.bit_depth` | none for streaming; TPDF for CD/podcast only if reducing |
 | Playback normalization | Spotify −14, Apple −16, … | `PLATFORMS` | informational; never a delivery target |
 | Unknown destination | — | `loudness_target` | raises, no silent fallback |
-| Reference curve | measured from a real track, or the normalized default | `analyze_reference`, `REFERENCE_CURVE` | linear sum = 1.0 when no reference is passed |
+| Reference curve | measured from a real track when `reference_path` is given, normalized default otherwise | `analyze_reference`, `REFERENCE_CURVE` | linear sum = 1.0 for the default; a partial measured curve fails loud |
 | Correlation drop after the chain | > 0.15 | `correlation_drop` | warning when `previous_path` is given |
-| Noise floor | > −50 dB | `GATE.noise_floor_moderate_db` | **measured in silence only**; `None` when the file has no gap |
-| Lossy source | cliff > 20 dB between 14–16 k and 16–18 k | `GATE.lossy_shelf_drop_db` | **measured** → `send_back` |
+| Sibilance | 5–9 kHz relative to full-band energy | `analysis.SIBILANCE_BAND` | measured as `spectral.sibilance_db_rel`; informs the question, not a de-esser threshold |
+| Noise floor | > −50 dB; minor between −60 and −50 | `GATE.noise_floor_moderate_db`, `GATE.noise_floor_minor_db` | **measured in silence only**; > −50 → `send_back`, > −60 → warning; `None` when the file has no gap |
+| Lossy source | cliff > 20 dB between 14–16 k and 16–18 k | `GATE.lossy_shelf_drop_db` | **measured** (suspected flag or measured drop) → `send_back` |
 | `eq.shelf`, `dynamic_eq`, `stereo.width`, `pan` | vocabulary only | `ACTIONS` | ❌ never emitted |
 
 **The decision model never gates.** It scores and chooses treatments; every refusal is measured.
@@ -137,14 +139,16 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 84 assertions: smoke + rules + analysis + adapter
+./start-sound-engineer-mcp.sh --test     # 123 tests: smoke + rules + analysis + adapter
 ```
 
-`tests/test_rules.py` asserts behaviour, not arithmetic:
+`tests/test_rules.py` asserts behaviour, plus the limiter's two-constraint arithmetic:
 
 * every balance label lowers the offender, and a fader points at a real exported stem;
 * a corrective request above 3 dB returns `send_back` instead of a clamped band;
 * 60 clipped frames in 10 s do **not** send back, 5000 do;
+* the limiter's input gain is min(requested loudness, peak budget), and the peak-only
+  default never invents input gain;
 * `dither` never appears for a streaming destination;
 * the two recipe builders reject any answer key missing from their schema (this is the test that
   catches a `low_end` / `low_mid` mismatch);
@@ -167,14 +171,14 @@ When you change a rule, break it on purpose first. If the suite stays green, the
 ## 6. The recipe contract
 
 Recipes are ordered arrays of `action` primitives; no plugin, vendor or DAW name appears.
-Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `2.0.0`).
+Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `2.1.0`).
 
 ```json
 [
-  {"action": "eq.high_pass", "target": "master", "schema": "2.0.0", "freq_hz": 25, "slope_db_oct": 12},
-  {"action": "eq.bell", "target": "master", "schema": "2.0.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"},
-  {"action": "limiter", "target": "master", "schema": "2.0.0", "ceiling_dbtp": -1.0, "expected_gain_reduction_db": 2.0},
-  {"action": "send_back", "target": "master", "schema": "2.0.0", "reasons": ["already_mastered:measured"]}
+  {"action": "eq.high_pass", "target": "master", "schema": "2.1.0", "freq_hz": 25, "slope_db_oct": 12},
+  {"action": "eq.bell", "target": "master", "schema": "2.1.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"},
+  {"action": "limiter", "target": "master", "schema": "2.1.0", "ceiling_dbtp": -1.0, "input_gain_db": 0.0, "expected_gain_reduction_db": 2.0},
+  {"action": "send_back", "target": "master", "schema": "2.1.0", "reasons": ["already_mastered:measured"]}
 ]
 ```
 
@@ -186,9 +190,12 @@ its source: `logic_plugins.set_eq_band_verified`, `set_param_verified`, `insert_
 
 ```bash
 python -m adapter.cli --recipe recipe.json --project /path/Session.logicx \
-    --tracks "vocal=3:Lead Vocal,drums=1:Drums" --master "0:Stereo Out"   # dry run
+    --tracks "vocal=3:Lead Vocal,01_bass.wav=2:Bass" --master "0:Stereo Out"   # dry run
 # add --apply to post to http://127.0.0.1:8765/mcp
 ```
+
+A `--tracks` key may be a role or an exported basename. When a recipe action carries `stem`,
+the basename wins over the role key; an explicit `target: "stem"` never falls back to a role.
 
 | Action | Status | Calls it emits |
 |---|---|---|
@@ -198,7 +205,7 @@ python -m adapter.cli --recipe recipe.json --project /path/Session.logicx \
 | `eq.high_pass`, `eq.high_pass_stem` | **ready** | `set_eq_band_verified` on `Low Cut`, `Frequency`/`Hz` (slope is a host popup → manual) |
 | `eq.shelf` | **ready** | `set_eq_band_verified` on `Low Shelf`/`High Shelf` |
 | `compressor` | **ready** | `insert_verified` + `set_param_verified` for `ratio`, `attack`, `release` |
-| `limiter` | **ready** | `insert_verified` + `set_param_verified` `outputCeiling`/`dB` |
+| `limiter` | **ready** | `insert_verified` + `set_param_verified` `gain`/`dB` (input) + `outputCeiling`/`dB`; the GR prediction is never written |
 | `polarity.invert` | **ready** | `insert_verified` Gain + `set_param_verified` `phaseInvert` |
 | `de_esser`, `dither`, `stereo.width`, `dynamic_eq` | **unsupported** | not in the verified catalog; the step carries the manual instruction |
 | `send_back` | **terminal** | nothing is applied |
@@ -226,13 +233,14 @@ sensitivity to a known change, not agreement with a trained ear.
 
 ## 8. Status
 
-`0.4.0` (rules 2.0.0). Measurement, gates, sections, references and the recipe contract are in place,
+`0.5.0` (rules 2.1.0). Measurement, gates, sections, references and the recipe contract are in place,
 with CI on 3.9/3.11/3.12. What is still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
 
 * **denoise, dynamic EQ, tonal shelves** — vocabulary without an action;
-* **the adapter covers volume, pan, Channel EQ (Hz/dB/Q), compressor ratio/attack/release, the
-  limiter ceiling and polarity** — de-esser, dither and stereo imaging have no verified surface;
-* **the mix half is thin** — no gain staging, phase-before-EQ, HPF policy or panning;
+* **the adapter covers volume, pan, Channel EQ (Hz/dB/Q), compressor ratio/attack/release, limiter
+  input gain and ceiling, and polarity** — de-esser, dither and stereo imaging have no verified
+  surface;
+* **panning** — vocabulary only; the mix recipe does not emit it yet;
 * **confidence policy** — answers below a threshold still produce a recipe instead of a refusal;
 * **no human-labelled evaluation** — sensitivity is measured, agreement with an engineer is not.
 

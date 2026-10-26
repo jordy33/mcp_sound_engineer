@@ -29,6 +29,9 @@ BANDS = {
     "mid": (500, 2000), "high_mid": (2000, 6000), "high": (6000, 16000),
 }
 
+# Sibilance is measured separately: it is not a seventh band of the reference curve.
+SIBILANCE_BAND = (5000.0, 9000.0)
+
 
 def load(path: str) -> tuple[np.ndarray, int]:
     """Return (samples[frames, channels] float32 in [-1,1], sample_rate).
@@ -78,12 +81,19 @@ def _mono(x: np.ndarray) -> np.ndarray:
     return x.mean(axis=1) if x.ndim == 2 and x.shape[1] > 1 else x.reshape(-1)
 
 
-def bands_db_rel(mono: np.ndarray, sr: int) -> dict[str, float]:
+def bands_db_rel(mono: np.ndarray, sr: int,
+                 bands: dict[str, tuple[float, float]] | None = None) -> dict[str, float]:
+    bands = BANDS if bands is None else bands
     spec = np.abs(np.fft.rfft(mono * np.hanning(len(mono)))) ** 2
     freqs = np.fft.rfftfreq(len(mono), 1 / sr)
     total = float(spec.sum()) + 1e-12
     return {name: round(10 * np.log10(float(spec[(freqs >= lo) & (freqs < hi)].sum()) / total + 1e-12), 1)
-            for name, (lo, hi) in BANDS.items()}
+            for name, (lo, hi) in bands.items()}
+
+
+def sibilance_db_rel(mono: np.ndarray, sr: int) -> float:
+    """5-9 kHz energy relative to full-band energy (the band a de-esser acts on)."""
+    return bands_db_rel(mono, sr, {"sibilance": SIBILANCE_BAND})["sibilance"]
 
 
 def integrated_lufs(data, sr: int) -> float:
@@ -270,6 +280,7 @@ def analyze_master(path: str) -> dict:
         },
         "spectral": {
             "bands_db_rel": bands_db_rel(mono, sr),
+            "sibilance_db_rel": sibilance_db_rel(mono, sr),
             "centroid_hz": _centroid(mono, sr),
         },
         "stereo": {"phase_correlation": stereo_correlation(data),
@@ -322,6 +333,7 @@ def analyze_reference(path: str) -> dict:
     return plain({
         "file": os.path.abspath(path),
         "reference_curve": bands_db_rel(mono, sr),
+        "sibilance_db_rel": sibilance_db_rel(mono, sr),
         "integrated_lufs": integrated_lufs(mono, sr),
         "true_peak_dbtp": true_peak_dbtp(mono, sr),
         "loudness_range_lu": loudness_range(mono, sr),
@@ -381,6 +393,7 @@ def analyze_stems(paths: list[str]) -> dict:
             "low_instrument": bool(bands_db_rel(mono, sr)["bass"] > -12.0),
             "peak_dbfs": round(20 * np.log10(np.max(np.abs(mono)) + 1e-12), 2),
             "bands_db_rel": bands_db_rel(mono, sr),
+            "sibilance_db_rel": sibilance_db_rel(mono, sr),
             "low_correlation": low_band_correlation(data, sr),
         })
     masking = []

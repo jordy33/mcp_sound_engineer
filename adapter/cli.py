@@ -10,7 +10,11 @@ from .logic_adapter import apply, plan, summary
 
 
 def _parse_targets(text: str) -> dict[str, dict]:
-    """`role=index:Track Name` pairs -> {role: {index, name}}."""
+    """`key=index:Track Name` pairs -> {key: {index, name}}.
+
+    The key may be a role (`vocal=3:Lead Vocal`) or the exported basename
+    (`01_bass.wav=2:Bass`), which is what a recipe's `stem` field carries.
+    """
     out: dict[str, dict] = {}
     for pair in filter(None, (p.strip() for p in text.split(","))):
         role, _, rest = pair.partition("=")
@@ -19,10 +23,21 @@ def _parse_targets(text: str) -> dict[str, dict]:
     return out
 
 
+def _parse_master(text: str) -> dict | None:
+    """`index:Name` or `master=index:Name` -> {index, name}."""
+    if not text:
+        return None
+    _, sep, rest = text.rpartition("=")
+    index, _, name = (rest if sep else text).partition(":")
+    return {"index": int(index), "name": name.strip()}
+
+
 def main() -> int:
     parser = argparse.ArgumentParser(prog="adapter")
     parser.add_argument("--recipe", required=True, help="recipe JSON file")
-    parser.add_argument("--tracks", default="", help="role=index:Name, e.g. vocal=3:Lead Vocal")
+    parser.add_argument("--tracks", default="",
+                        help="role-or-basename=index:Name, e.g. vocal=3:Lead Vocal "
+                             "or 01_bass.wav=2:Bass")
     parser.add_argument("--master", default="", help="index:Name of the master strip")
     parser.add_argument("--project", required=True, help="absolute path to the .logicx package")
     parser.add_argument("--apply", action="store_true", help="execute the plan (default: dry run)")
@@ -33,7 +48,7 @@ def main() -> int:
 
     recipe = json.load(open(args.recipe))
     tracks = _parse_targets(args.tracks)
-    master = _parse_targets(args.master).get("master") if args.master else None
+    master = _parse_master(args.master)
 
     steps = plan(recipe, tracks, master, args.project,
                  FaderCalibration.load(args.fader_calibration))

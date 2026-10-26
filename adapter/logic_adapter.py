@@ -8,8 +8,11 @@ Grounded in the mcp_logic source (v3.18.0):
   AX mapping is needed. Bands: Low Cut, Low Shelf, Peak 1..4, High Shelf, High Cut.
 * `logic_plugins.set_param_verified` writes verified parameters; `unit` is optional
   (it comes from the parameter metadata). Compressor: threshold(%, normalized),
-  ratio, attack, release, makeup. Limiter: gain, outputCeiling, release.
+  ratio, attack, release, makeup. Limiter: gain (input), outputCeiling, release.
   Gain: gain, phaseInvert.
+
+`input_gain_db` is a control and is written as the Limiter `gain`; the recipe's
+`expected_gain_reduction_db` is only a prediction and is never written.
 * Every verified write requires `mode: duplicate_applyback` and
   `project_expected_path`; `insert_verified` also requires `expected_name`.
 
@@ -32,7 +35,7 @@ CAPABILITIES = {
     "eq.shelf":          "ready",
     "eq.high_pass_stem": "ready",
     "compressor":        "ready",      # insert + ratio/attack/release
-    "limiter":           "ready",      # insert Limiter + outputCeiling
+    "limiter":           "ready",      # insert Limiter + gain (input) + outputCeiling
     "polarity.invert":   "ready",      # Gain plug-in, phaseInvert
     "de_esser":          "unsupported",
     "dither":            "unsupported",
@@ -94,7 +97,7 @@ def plan(recipe: list[dict], tracks: dict[str, dict] | None = None,
         if target is None:
             step["status"] = "unresolved"
             step["why"] = (f"no track for target {action.get('target')!r}; "
-                           f"pass --tracks <role>=<index>:<Track Name>")
+                           f"pass --tracks <role-or-basename>=<index>:<Track Name>")
             steps.append(step)
             continue
 
@@ -134,17 +137,25 @@ def plan(recipe: list[dict], tracks: dict[str, dict] | None = None,
 # --------------------------------------------------------------------------
 # call builders
 # --------------------------------------------------------------------------
+def _stem_target(action: dict, tracks: dict) -> dict | None:
+    """Resolve a recipe stem (exported basename) to a track mapping."""
+    stem = action.get("stem")
+    if not stem:
+        return None
+    base = os.path.basename(stem)
+    return tracks.get(base) or tracks.get(os.path.splitext(base)[0])
+
+
 def _resolve_target(action: dict, tracks: dict, master: dict | None) -> dict | None:
     target = (action.get("target") or "master").lower()
     if target in ("master", "mix_bus", "bus"):
         return master
     if target == "stem":
-        stem = action.get("stem")
-        if not stem:
-            return None
-        base = os.path.basename(stem)
-        return tracks.get(base) or tracks.get(os.path.splitext(base)[0])
-    return tracks.get(target)
+        # Explicit stem targets never fall back to a role key: guessing here is how
+        # a fader move lands on the wrong track.
+        return _stem_target(action, tracks)
+    # A role target prefers the stem the recipe actually names, then the role key.
+    return _stem_target(action, tracks) or tracks.get(target)
 
 
 def _mixer_step(step: dict, name: str, action: dict, target: dict,
@@ -219,6 +230,10 @@ def _compressor_calls(action: dict, target: dict, project_path: str) -> list[dic
 
 def _limiter_calls(action: dict, target: dict, project_path: str) -> list[dict]:
     calls = [_insert_call(target, "Limiter", project_path)]
+    # The input gain is the control. The expected GR is a prediction, not a knob.
+    if "input_gain_db" in action:
+        calls.append(_param_call(target, "Limiter", "gain",
+                                 float(action["input_gain_db"]), project_path, unit="dB"))
     if "ceiling_dbtp" in action:
         calls.append(_param_call(target, "Limiter", "outputCeiling",
                                  float(action["ceiling_dbtp"]), project_path, unit="dB"))

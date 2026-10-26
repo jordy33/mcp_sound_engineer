@@ -25,7 +25,7 @@ Logic / REAPER / Ableton ──► mcp_sound_engineer ──► analysis.py   (n
 
 ## Contract
 
-The only coupling is `docs/RECIPE.md` (schema `1.0.0`). It is versioned; adapters declare which
+The only coupling is `docs/RECIPE.md` (schema `2.1.0`). It is versioned; adapters declare which
 version they can apply.
 
 ## Failure modes the adapter must handle

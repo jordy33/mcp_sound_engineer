@@ -15,8 +15,8 @@ import math
 import os
 import re
 
-RULES_VERSION = "2.0.0"
-RECIPE_SCHEMA_VERSION = "2.0.0"
+RULES_VERSION = "2.1.0"
+RECIPE_SCHEMA_VERSION = "2.1.0"
 
 # --- Gates: when to refuse to master a mix -----------------------------------
 GATE = {
@@ -27,6 +27,9 @@ GATE = {
     "noise_floor_minor_db": -60.0,
     "lossy_shelf_drop_db": 20.0,
     "max_limiter_gr_db": 4.0,
+    # PRODUCT RULE: peaks this far over the ceiling are trimmed at the limiter input.
+    # Beyond cap + trim the master is sent back instead of over-limiting it.
+    "max_limiter_input_trim_db": 3.0,
     "max_gain_reduction_db": 3.0,
     "min_gain_reduction_db": 1.0,
     "max_total_gain_reduction_db": 6.0,   # conservative end of the 6-8 dB source range
@@ -36,11 +39,12 @@ GATE = {
 # Which GATE constants are actually enforced by code (tests assert completeness).
 IMPLEMENTED_GATES = {
     "max_corrective_db_per_point", "max_cumulative_corrective_db",
-    "min_phase_correlation", "max_limiter_gr_db", "max_gain_reduction_db",
-    "min_gain_reduction_db", "noise_floor_moderate_db", "lossy_shelf_drop_db",
-    "max_total_gain_reduction_db", "min_mono_cancel_db",
+    "min_phase_correlation", "max_limiter_gr_db", "max_limiter_input_trim_db",
+    "max_gain_reduction_db", "min_gain_reduction_db", "noise_floor_moderate_db",
+    "noise_floor_minor_db", "lossy_shelf_drop_db", "max_total_gain_reduction_db",
+    "min_mono_cancel_db",
 }
-UNIMPLEMENTED_GATES = {"noise_floor_minor_db"}
+UNIMPLEMENTED_GATES: set[str] = set()
 
 # --- The ten stages, in order ------------------------------------------------
 CHAIN = [
@@ -52,7 +56,9 @@ CHAIN = [
     ("dynamic_eq",     {"crossovers_hz": (80, 120, 2000, 3000, 8000, 10000)}),
     ("eq.shelf",       {"q": (0.5, 1.5), "role": "tonal"}),
     ("stereo.width",   {"mono_below_hz": 120, "max_width_db": 2.0}),
-    ("limiter",        {"ceiling_dbtp": -1.0, "max_gr_db": 4.0}),
+    # input_gain_db is the control (dB into the limiter); expected GR is a prediction.
+    ("limiter",        {"ceiling_dbtp": -1.0, "max_gr_db": 4.0,
+                        "max_input_trim_db": 3.0}),
     ("dither",         {"always_last": True}),
 ]
 
@@ -71,7 +77,9 @@ PLATFORMS = {
     "podcast":     {"normalization_lufs": -16.0, "true_peak_ceiling": -1.0, "bit_depth": 16, "dither": "tpdf"},
 }
 
-# --- Reference curve (dB relative to total energy), normalized to sum to 0 dB --
+# --- Reference curve (dB relative to total energy) ---------------------------
+# Normalized so the linear powers sum to 1.0 (0 dB total). Used only when no
+# measured reference was supplied.
 _RAW_CURVE = {"sub": -18.0, "bass": -11.0, "low_mid": -12.0,
               "mid": -8.0, "high_mid": -13.0, "high": -17.0}
 _TOTAL = sum(10 ** (v / 10) for v in _RAW_CURVE.values())
@@ -106,7 +114,8 @@ MASTER_QUESTIONS = {
                  "instructions": "2-6 kHz vs reference_curve: how much presence excess is there?",
                  "criteria": ["none", "slight", "noticeable", "heavy", "extreme"]},
     "sibilance": {"type": "choice",
-                  "instructions": "Which sibilance treatment fits, given the 5-9 kHz balance?",
+                  "instructions": "Which sibilance treatment fits, given spectral.sibilance_db_rel "
+                                  "(5-9 kHz) and the reference's sibilance_db_rel when one was measured?",
                   "criteria": {"none": "no treatment needed",
                                "deess": "dynamic de-esser",
                                "cut": "narrow static cut around 7 kHz"}},
@@ -227,7 +236,8 @@ def evaluate_gates(facts: dict) -> dict:
         reasons.append("noise_floor:measured")
 
     bandwidth = facts.get("bandwidth") or {}
-    if bandwidth.get("lossy_suspected"):
+    if (bandwidth.get("lossy_suspected")
+            or float(bandwidth.get("drop_db") or 0.0) > GATE["lossy_shelf_drop_db"]):
         reasons.append("lossy_source:measured")
 
     # PRODUCT RULE (not in the source): a finished master cannot be mastered again.
@@ -261,40 +271,112 @@ def loudness_warnings(facts: dict, target: dict) -> list[str]:
     return out
 
 
-def expected_limiter_gr(facts: dict, target: dict) -> float:
-    """Arithmetic, not a model opinion: how far the master is above the playback reference."""
-    stereo = facts.get("stereo") or {}
-    cancel = stereo.get("mono_cancel_db")
-    if cancel is not None and float(cancel) < GATE["min_mono_cancel_db"]:
-        out.append(f"mono fold-down loses {abs(cancel)} dB; check phase before the chain")
-    floor = (facts.get("noise") or {}).get("floor_dbfs")
-    if floor is not None and GATE["noise_floor_minor_db"] < float(floor) <= GATE["noise_floor_moderate_db"]:
-        out.append(f"noise floor {floor} dBFS is minor but audible on quiet passages")
-    ref = target.get("normalization_lufs")
-    lufs = float((facts.get("loudness") or {}).get("integrated_lufs", ref or 0.0))
-    if ref is None:
-        return 0.0
-    return round(clamp(lufs - ref, 0.0, GATE["max_limiter_gr_db"]), 1)
+def _round_db(value: float) -> float:
+    """One decimal; never emit JSON's -0.0."""
+    rounded = round(float(value), 1)
+    return 0.0 if rounded == 0 else rounded
 
 
-def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -> list[dict]:
+def plan_limiter(lufs: float, tp: float, ceiling: float,
+                 desired_lufs: float | None = None,
+                 cap: float = GATE["max_limiter_gr_db"]) -> dict:
+    """Two constraints, not one: the requested loudness and the peak ceiling.
+
+    `input_gain_db` is the control written to the limiter;
+    `expected_gain_reduction_db` is a prediction from the measured loudness and true
+    peak. There is no delivery loudness target: without `desired_lufs` the plan is
+    peak-only, which is the recommended mode for streaming (playback is normalized
+    anyway, so extra input gain buys no loudness and costs dynamics).
+    """
+    g_loud = 0.0 if desired_lufs is None else max(0.0, desired_lufs - lufs)
+    g_max = ceiling + cap - tp
+    gain = min(g_loud, g_max)
+    gr = max(0.0, tp + gain - ceiling)
+    # Algebraically identical to ceiling-(tp-lufs)+gr whenever gr > 0; without
+    # limiting it reports the real projection instead of overestimating loudness.
+    approx = _round_db(lufs + gain)
+    return {
+        "input_gain_db": _round_db(gain),
+        "expected_gain_reduction_db": _round_db(gr),
+        "loudness_reached": True if desired_lufs is None else approx >= desired_lufs - 0.2,
+        "approx_lufs_after": approx,
+        "plr_db": _round_db(tp - lufs),
+    }
+
+
+_NEUTRAL_LIMITER_PLAN = {
+    "input_gain_db": 0.0,
+    "expected_gain_reduction_db": 0.0,
+    "loudness_reached": True,
+    "approx_lufs_after": None,
+    "plr_db": None,
+}
+
+
+def limiter_warnings(recipe: list) -> list[str]:
+    """Surface a pre-limiter trim or a loudness request the limiter cannot meet."""
+    out: list[str] = []
+    limiter = next((a for a in recipe or []
+                    if isinstance(a, dict) and a.get("action") == "limiter"), None)
+    if limiter is None:
+        return out
+    gain = limiter.get("input_gain_db")
+    if isinstance(gain, (int, float)) and not isinstance(gain, bool) and gain < 0:
+        out.append(f"input trim {abs(gain)} dB before the limiter: the true peak exceeds "
+                   f"the ceiling by more than the {GATE['max_limiter_gr_db']} dB "
+                   f"gain-reduction budget")
+    if limiter.get("desired_lufs") is not None and limiter.get("loudness_reached") is False:
+        out.append(f"loudness request {limiter['desired_lufs']} LUFS not reached: approx "
+                   f"{limiter.get('approx_lufs_after')} LUFS after the limiter "
+                   f"(PLR {limiter.get('plr_db')} dB); fix dynamics upstream instead of "
+                   f"pushing the limiter")
+    return out
+
+
+def _limiter_plan(facts: dict, target: dict, desired_lufs: float | None) -> dict:
+    loud = facts.get("loudness") or {}
+    lufs, tp = loud.get("integrated_lufs"), loud.get("true_peak_dbtp")
+    if lufs is None or tp is None:
+        # No measurement, no invented dB.
+        return dict(_NEUTRAL_LIMITER_PLAN)
+    return plan_limiter(float(lufs), float(tp), target["true_peak_ceiling"], desired_lufs)
+
+
+def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
+                        reference_curve: dict | None = None,
+                        desired_lufs: float | None = None) -> list[dict]:
     require(answers, MASTER_QUESTIONS)
     target = loudness_target(platform)
+
+    reference = REFERENCE_CURVE if reference_curve is None else reference_curve
+    if not isinstance(reference, dict):
+        raise ValueError("reference_curve must be a dict of the six bands")
+    missing = [band for band in BAND_CENTERS if band not in reference]
+    if missing:
+        # A partial measured curve must not be silently mixed with the default.
+        raise ValueError(f"reference_curve is missing bands: {missing}")
 
     gates = evaluate_gates(facts)
     if gates["send_back"]:
         return [_action("send_back", reasons=gates["reasons"])]
 
+    limiter_plan = _limiter_plan(facts, target, desired_lufs)
+    ceiling = target["true_peak_ceiling"]
+    tp = (facts.get("loudness") or {}).get("true_peak_dbtp")
+    if tp is not None and (float(tp) - ceiling) > (GATE["max_limiter_gr_db"]
+                                                    + GATE["max_limiter_input_trim_db"]):
+        return [_action("send_back",
+                        reasons=[f"peak_beyond_limiter:{float(tp)}dBTP:{ceiling}dBTP"])]
+
     recipe: list[dict] = [_action("eq.high_pass", freq_hz=25, slope_db_oct=12, reason="sub-bass cleanup")]
 
     # Corrective moves: over the cap is a send-back, never a silent clamp.
     total = 0.0
-    reference = REFERENCE_CURVE
     for band, group in (("low_end", ("sub", "bass", "low_mid")), ("high_mid", ("mid", "high_mid"))):
         level = _score(answers, band)
         if level < 2.5:
             continue
-        measured = facts.get("spectral", {}).get("bands_db_rel", {}) if facts else {}
+        measured = (facts.get("spectral") or {}).get("bands_db_rel") or {}
         excess = {b: float(measured.get(b, reference[b])) - reference[b] for b in group}
         worst = max(excess, key=excess.get)
         freq = BAND_CENTERS[worst]
@@ -320,7 +402,7 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
                               reason="restore range on over-compressed material"))
 
     total_gr = sum(a.get("gain_reduction_db", 0.0) for a in recipe if a["action"] == "compressor")
-    total_gr += expected_limiter_gr(facts, target)
+    total_gr += limiter_plan["expected_gain_reduction_db"]
     if total_gr > GATE["max_total_gain_reduction_db"]:
         return [_action("send_back",
                         reasons=[f"gain_reduction_budget:{round(total_gr, 1)}dB"])]
@@ -336,8 +418,17 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify") -
                             reasons=[f"corrective_beyond_cap:cumulative:{round(total, 1)}dB"])]
         recipe.append(_action("eq.bell", freq_hz=7000, gain_db=-needed, q=6.0, role="corrective"))
 
-    recipe.append(_action("limiter", ceiling_dbtp=target["true_peak_ceiling"],
-                          expected_gain_reduction_db=expected_limiter_gr(facts, target)))
+    limiter_params = {
+        "ceiling_dbtp": ceiling,
+        "input_gain_db": limiter_plan["input_gain_db"],
+        "expected_gain_reduction_db": limiter_plan["expected_gain_reduction_db"],
+        "loudness_reached": limiter_plan["loudness_reached"],
+        "approx_lufs_after": limiter_plan["approx_lufs_after"],
+        "plr_db": limiter_plan["plr_db"],
+    }
+    if desired_lufs is not None:
+        limiter_params["desired_lufs"] = desired_lufs
+    recipe.append(_action("limiter", **limiter_params))
 
     # Dither belongs to the destination, and only when bits are actually reduced.
     source_bits = facts.get("bit_depth")
@@ -353,6 +444,32 @@ def correlation_drop(before: dict, after: dict, limit: float = 0.15) -> dict:
     a = float((after.get("stereo") or {}).get("phase_correlation", 1.0))
     drop = round(b - a, 3)
     return {"before": b, "after": a, "drop": drop, "exceeds": drop > limit}
+
+
+def _limiter_violations(action: dict, index: int) -> list[dict]:
+    """Check the control contract without ever raising on malformed values."""
+    out: list[dict] = []
+    numeric: dict[str, float] = {}
+    for field, missing_code in (("ceiling_dbtp", "missing_limiter_ceiling"),
+                                ("input_gain_db", "missing_limiter_input_gain"),
+                                ("expected_gain_reduction_db", "missing_limiter_gr")):
+        if field not in action:
+            out.append({"code": missing_code, "index": index})
+            continue
+        value = action[field]
+        if isinstance(value, bool) or not isinstance(value, (int, float)):
+            out.append({"code": "invalid_limiter_field", "index": index, "field": field})
+            continue
+        numeric[field] = float(value)
+    if numeric.get("ceiling_dbtp", -1.0) > -1.0:
+        out.append({"code": "limiter_ceiling", "index": index,
+                    "ceiling_dbtp": numeric["ceiling_dbtp"]})
+    if numeric.get("input_gain_db", 0.0) < -GATE["max_limiter_input_trim_db"]:
+        out.append({"code": "limiter_input_trim_cap", "index": index,
+                    "input_gain_db": numeric["input_gain_db"]})
+    if numeric.get("expected_gain_reduction_db", 0.0) > GATE["max_limiter_gr_db"]:
+        out.append({"code": "limiter_cap", "index": index})
+    return out
 
 
 def validate_recipe(recipe: list) -> list[dict]:
@@ -382,8 +499,8 @@ def validate_recipe(recipe: list) -> list[dict]:
             corrective += gain
         if name == "compressor" and float(action.get("gain_reduction_db", 0)) > GATE["max_gain_reduction_db"]:
             violations.append({"code": "gain_reduction_cap", "index": index})
-        if name == "limiter" and float(action.get("expected_gain_reduction_db", 0)) > GATE["max_limiter_gr_db"]:
-            violations.append({"code": "limiter_cap", "index": index})
+        if name == "limiter":
+            violations.extend(_limiter_violations(action, index))
         if name == "eq.high_pass" and float(action.get("freq_hz", 0)) > 30:
             violations.append({"code": "high_pass_range", "index": index})
         if name == "dither" and int(action.get("bit_depth", 24)) not in (16, 24):
@@ -502,65 +619,3 @@ def _match_stem(stems: list[str], role: str) -> str | None:
         return None
     scored.sort(key=lambda item: -item[0])
     return scored[0][1]
-def mix_warnings(answers: dict, stems: list[str]) -> list[str]:
-    """Say out loud when a decision cannot be applied to the exported files."""
-    out: list[str] = []
-    balance = _choice(answers, "balance")
-    role = {"vocal_too_high": "vocal", "drums_too_loud": "drums",
-            "bass_too_heavy": "bass"}.get(balance)
-    if role and not _match_stem(stems, role):
-        out.append(f"no exported stem matches {role!r}; the fader move was omitted "
-                   f"(stems: {[s.split('/')[-1] for s in stems]})")
-    return out
-
-
-def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | None = None) -> list[dict]:
-    """Mix decisions. PRODUCT DEFAULTS: not sourced from the mastering methodology."""
-    require(answers, MIX_QUESTIONS)
-    recipe: list[dict] = []
-
-    balance = _choice(answers, "balance")
-    # Every label names the problem, so every correction lowers the offender.
-    moves = {"vocal_too_high": ("vocal", -2.0), "drums_too_loud": ("drums", -2.0),
-             "bass_too_heavy": ("bass", -2.0)}
-    if balance in moves:
-        target, gain = moves[balance]
-        stem = _match_stem(stems, target)
-        if stem:
-            recipe.append(_action("fader", target=target, gain_db=clamp(gain, -3.0, 3.0),
-                                  stem=stem))
-    masking = _score(answers, "masking")
-    if masking >= 2.5:
-        recipe.append(_action("eq.bell", target="bus", freq_hz=300,
-                              gain_db=-clamp(masking - 2.0, 0.0, 3.0), q=4.0, role="corrective"))
-    # Gain staging is arithmetic, not taste: bring every stem toward -18 LUFS.
-    for stem in stem_facts or []:
-        lufs = float(stem.get("integrated_lufs", GAIN_STAGING_TARGET_LUFS))
-        move = clamp(GAIN_STAGING_TARGET_LUFS - lufs, -GAIN_STAGING_MAX_MOVE_DB,
-                     GAIN_STAGING_MAX_MOVE_DB)
-        if abs(move) >= 1.0:
-            recipe.append(_action("fader", target="stem", gain_db=round(move, 1),
-                                  stem=stem["path"], reason="gain_staging"))
-
-    # Phase before EQ: a cancelling stem gets polarity, not a filter.
-    if _choice(answers, "phase_before_eq") == "polarity":
-        for stem in stem_facts or []:
-            if float(stem.get("phase_correlation", 1.0)) < GATE["min_phase_correlation"]:
-                recipe.append(_action("polarity.invert", target="stem", stem=stem["path"],
-                                      reason="phase_correlation"))
-
-    # High-pass policy: everything that is not a low instrument.
-    if _choice(answers, "hpf_policy") == "all_but_kick_bass":
-        for stem in stem_facts or []:
-            if not stem.get("low_instrument", True):
-                recipe.append(_action("eq.high_pass_stem", target="stem", stem=stem["path"],
-                                      freq_hz=80, slope_db_oct=12))
-
-    for stem in stem_facts or []:
-        if float(stem.get("low_correlation", 1.0)) < GATE["min_phase_correlation"]:
-            recipe.append(_action("stereo.width", target="bus", mono_below_hz=120,
-                                  stem=stem["path"], reason="mono bass"))
-    if _choice(answers, "bus_comp") == "glue":
-        recipe.append(_action("compressor", target="mix_bus", ratio=2.0, attack_ms=30,
-                              release_ms=250, gain_reduction_db=2.0))
-    return recipe

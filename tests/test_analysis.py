@@ -122,6 +122,36 @@ def test_band_energy_is_localized():
     assert high["high"] > high["bass"], high
 
 
+def test_sibilance_band_is_measured():
+    sibilant = analysis.sibilance_db_rel(_sine(7000, 0.5), SR)
+    low = analysis.sibilance_db_rel(_sine(440, 0.5), SR)
+    assert sibilant > -3.0, sibilant
+    assert low < -40.0, low
+
+
+def test_reference_includes_sibilance():
+    ref = analysis.analyze_reference(_wav(_sine(7000, 0.3)))
+    assert np.isfinite(ref["sibilance_db_rel"]), ref
+
+
+def test_stem_includes_sibilance():
+    facts = analysis.analyze_stems([
+        _wav(_sine(7000, 0.2), name="01_vocals.wav"),
+        _wav(_sine(100, 0.2), name="02_bass.wav"),
+    ])
+    values = {s["name"]: s["sibilance_db_rel"] for s in facts["stems"]}
+    assert all(np.isfinite(v) for v in values.values()), values
+    assert values["01_vocals"] > values["02_bass"], values
+
+
+def test_band_inventory_stays_six():
+    """Sibilance is measured, but it is not a seventh band of the reference curve."""
+    facts = analysis.analyze_master(_wav(_sine(440, 0.3)))
+    assert len(analysis.BANDS) == 6
+    assert set(facts["spectral"]["bands_db_rel"]) == set(analysis.BANDS)
+    assert "sibilance" not in facts["spectral"]["bands_db_rel"]
+
+
 def test_phase_correlation_extremes():
     mono = _sine(440, 0.5)
     same = np.stack([mono, mono], axis=1)

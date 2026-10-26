@@ -13,8 +13,9 @@ those numbers, which means:
 * it cannot be surprised. If the measurement does not capture a problem, the problem does not exist.
 
 Not implemented yet: denoise, dynamic EQ, tonal shelves. The adapter applies volume, pan, Channel EQ in
-engineering units, compressor ratio/attack/release, the limiter ceiling and polarity; de-esser,
-dither and stereo imaging have no verified surface. Per-section analysis, reference-track deviation and the correlation drop after
+engineering units, compressor ratio/attack/release, the limiter input gain and output ceiling, and
+polarity; de-esser, dither and stereo imaging have no verified surface. It never writes the limiter's
+gain-reduction prediction. Per-section analysis, reference-track deviation and the correlation drop after
 the chain **are** implemented (`analyze_sections`, `analyze_reference`, `judge_master.previous_path`).
 
 ## Measurement approximations
@@ -29,7 +30,10 @@ the chain **are** implemented (`analyze_sections`, `analyze_reference`, `judge_m
 | noise floor | measurable **only inside a real gap**; returns `None` on continuous music |
 | lossy detection | a cliff test at 16 kHz; a 22 kHz cut on a 44.1 kHz file still looks "full band" |
 | stem gates | need named stems (`vocals`, `drums`, `bass`); an unnamed export cannot be role-matched |
-| reference curve | a **constant**, not a measured commercial reference (see roadmap) |
+| reference curve | measured from the file when `reference_path` is given; a normalized **constant** otherwise |
+| sibilance | 5–9 kHz energy relative to full-band; a descriptor, **not** a de-esser threshold |
+| limiter gain reduction | a **prediction** from measured LUFS/true peak, not a measurement of the limited file; it assumes the peak lands on the ceiling, and the real GR depends on the material |
+| pre-limiter trim | up to 3 dB of input trim; beyond 4 dB GR + 3 dB trim (7 dB over the ceiling) the recipe is a terminal `send_back`, not a request to limit harder |
 
 ## It does not know the music
 

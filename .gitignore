@@ -10,3 +10,4 @@ renders/
 .venv/
 .env
 .run/
+*.egg-info/

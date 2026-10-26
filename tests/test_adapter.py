@@ -7,6 +7,7 @@ sys.path.insert(0, ROOT)
 sys.path.insert(0, os.path.join(ROOT, "server"))
 
 import rules  # noqa: E402
+from adapter.cli import _parse_master  # noqa: E402
 from adapter.fader_calibration import FaderCalibration  # noqa: E402
 from adapter.logic_adapter import (CAPABILITIES, MODE,  # noqa: E402
                                    db_to_fader, plan, summary)
@@ -16,6 +17,14 @@ FADER = FaderCalibration([[6, 1.0], [0, 0.8], [-6, 0.6], [-20, 0.4], [-60, 0.2]]
 
 PROJECT = "/tmp/session.logicx"
 MASTER = {"index": 0, "name": "Stereo Out"}
+
+
+def test_master_target_accepts_bare_index_or_key():
+    """README documents `--master "0:Stereo Out"`; the keyed form must also work."""
+    expected = {"index": 0, "name": "Stereo Out"}
+    assert _parse_master("0:Stereo Out") == expected
+    assert _parse_master("master=0:Stereo Out") == expected
+    assert _parse_master("") is None
 
 
 def test_every_action_has_a_capability():
@@ -64,6 +73,61 @@ def test_limiter_is_supported_through_the_verified_surface():
     assert commands == ["insert_verified", "set_param_verified"]
     ceiling = steps[0]["calls"][1]["arguments"]["params"]
     assert ceiling["param"] == "outputCeiling" and ceiling["value"] == -1.0
+
+
+def test_role_target_prefers_the_recipe_stem():
+    steps = plan([{"action": "fader", "target": "vocal", "gain_db": -2.0,
+                   "stem": "/s/01_vocals.wav"}],
+                 tracks={"01_vocals.wav": {"index": 3, "name": "Lead Vocal"},
+                         "vocal": {"index": 9, "name": "Wrong Vocal"}},
+                 fader_calibration=FADER)
+    assert steps[0]["status"] == "ready", steps[0]
+    assert steps[0]["calls"][0]["arguments"]["params"]["track"] == 3, steps[0]
+
+
+def test_stem_key_without_extension_resolves():
+    steps = plan([{"action": "polarity.invert", "target": "stem",
+                   "stem": "/s/01_bass.wav"}],
+                 tracks={"01_bass": {"index": 2, "name": "Bass"}}, project_path=PROJECT)
+    assert steps[0]["status"] == "ready", steps[0]
+    assert steps[0]["calls"][0]["arguments"]["params"]["track"] == 2, steps[0]
+
+
+def test_role_target_falls_back_to_role_key():
+    steps = plan([{"action": "fader", "target": "vocal", "gain_db": -2.0}],
+                 tracks={"vocal": {"index": 4, "name": "Vox"}},
+                 fader_calibration=FADER)
+    assert steps[0]["status"] == "ready", steps[0]
+    assert steps[0]["calls"][0]["arguments"]["params"]["track"] == 4, steps[0]
+
+
+def test_stem_target_never_falls_back_to_role():
+    steps = plan([{"action": "polarity.invert", "target": "stem",
+                   "stem": "/s/does_not_exist.wav"}],
+                 tracks={"stem": {"index": 5, "name": "Stem"}}, project_path=PROJECT)
+    assert steps[0]["status"] == "unresolved", steps[0]
+
+
+def test_limiter_writes_input_gain():
+    steps = plan([{"action": "limiter", "target": "master", "ceiling_dbtp": -1.0,
+                   "input_gain_db": -2.0, "expected_gain_reduction_db": 4.0}],
+                 master=MASTER, project_path=PROJECT)
+    calls = steps[0]["calls"]
+    assert [c["arguments"]["command"] for c in calls] == [
+        "insert_verified", "set_param_verified", "set_param_verified"]
+    gain, ceiling = calls[1]["arguments"]["params"], calls[2]["arguments"]["params"]
+    assert (gain["param"], gain["value"], gain["unit"]) == ("gain", -2.0, "dB"), gain
+    assert (ceiling["param"], ceiling["value"], ceiling["unit"]) == (
+        "outputCeiling", -1.0, "dB"), ceiling
+
+
+def test_limiter_does_not_write_the_prediction():
+    steps = plan([{"action": "limiter", "target": "master", "ceiling_dbtp": -1.0,
+                   "expected_gain_reduction_db": 4.0}],
+                 master=MASTER, project_path=PROJECT)
+    params = [c["arguments"]["params"].get("param") for c in steps[0]["calls"]]
+    assert "gain" not in params, params
+    assert "expected_gain_reduction_db" not in params, params
 
 
 def test_compressor_writes_ratio_attack_release():

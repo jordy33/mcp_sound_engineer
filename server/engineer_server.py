@@ -12,14 +12,14 @@ import sys
 try:  # installed as a package
     from . import rules
     from .analysis import analyze_master, analyze_reference, analyze_sections, analyze_stems
-    from .jev import JevError, ask, config
+    from .jev import ask, config
 except ImportError:  # executed as a script: python server/engineer_server.py
     import rules
     from analysis import analyze_master, analyze_reference, analyze_sections, analyze_stems
-    from jev import JevError, ask, config
+    from jev import ask, config
 
 SERVER_NAME = "mcp_sound_engineer"
-SERVER_VERSION = "0.4.0"
+SERVER_VERSION = "0.5.0"
 
 # Jev schemas live in rules.py: one source of truth for the answer keys.
 MASTER_QUESTIONS = rules.MASTER_QUESTIONS
@@ -53,7 +53,8 @@ def tool_validate_recipe(recipe: list) -> dict:
 
 def tool_judge_master(path: str, platform: str = "spotify",
                       reference_path: str | None = None,
-                      previous_path: str | None = None) -> dict:
+                      previous_path: str | None = None,
+                      desired_lufs: float | None = None) -> dict:
     facts = analyze_master(path)
     target = rules.loudness_target(platform)
     if reference_path:
@@ -62,12 +63,14 @@ def tool_judge_master(path: str, platform: str = "spotify",
     else:
         measured, reference_curve = None, rules.REFERENCE_CURVE
     gates = rules.evaluate_gates(facts)
+    warnings = rules.loudness_warnings(facts, target)
     if gates["send_back"]:
         # Measured refusals must not depend on a network call or a key.
+        recipe = [rules._action("send_back", reasons=gates["reasons"])]
+        warnings += rules.limiter_warnings(recipe)
         return {"facts": facts, "answers": {}, "gates": gates,
-                "recipe": [rules._action("send_back", reasons=gates["reasons"])],
-                "target": target, "reference": measured,
-                "warnings": rules.loudness_warnings(facts, target)}
+                "recipe": recipe, "target": target, "reference": measured,
+                "reference_curve": reference_curve, "warnings": warnings}
 
     state = {
         "context": {"stage": "mastering", "platform": platform,
@@ -79,9 +82,14 @@ def tool_judge_master(path: str, platform: str = "spotify",
         "reference_curve": reference_curve,
         "limits": rules.GATE,
     }
+    if measured is not None:
+        state["reference_sibilance_db_rel"] = measured.get("sibilance_db_rel")
     answers = ask(state, MASTER_QUESTIONS)
-    warnings = rules.loudness_warnings(facts, target)
     confidence = rules.confidence_report(answers)
+    recipe = rules.build_master_recipe(answers, facts, platform,
+                                       reference_curve=reference_curve,
+                                       desired_lufs=desired_lufs)
+    warnings += rules.limiter_warnings(recipe)
     if confidence["needs_human"]:
         warnings.append(f"low confidence on {sorted(confidence['low'])}; treat the recipe as a draft")
     if previous_path:
@@ -89,10 +97,10 @@ def tool_judge_master(path: str, platform: str = "spotify",
         if drop["exceeds"]:
             warnings.append(f"phase correlation dropped {drop['drop']} after the chain "
                             f"({drop['before']} -> {drop['after']}); check the last stage added")
-    return {"facts": facts, "answers": answers,
-            "recipe": rules.build_master_recipe(answers, facts, platform),
+    return {"facts": facts, "answers": answers, "recipe": recipe,
             "target": target,
             "reference": measured,
+            "reference_curve": reference_curve,
             "confidence": confidence,
             "warnings": warnings}
 
@@ -158,9 +166,14 @@ TOOLS = {
             "path": {"type": "string"},
             "platform": {"type": "string", "enum": list(rules.PLATFORMS)},
             "reference_path": {"type": "string"},
-            "previous_path": {"type": "string"}}, "required": ["path"]},
+            "previous_path": {"type": "string"},
+            "desired_lufs": {"type": "number",
+                             "description": "Optional loudness request for the limiter input "
+                                            "gain; omit for peak-only (recommended). Not a "
+                                            "delivery target."}}, "required": ["path"]},
         "handler": lambda a: tool_judge_master(a["path"], a.get("platform", "spotify"),
-                                               a.get("reference_path"), a.get("previous_path")),
+                                               a.get("reference_path"), a.get("previous_path"),
+                                               a.get("desired_lufs")),
     },
     "judge_mix": {
         "description": "Typed mixing decisions via Jev: balance, masking, bus compression, "
@@ -196,11 +209,20 @@ def make_error(rid, code, message):
 
 
 def handle(msg: dict) -> dict | None:
+    if not isinstance(msg, dict):
+        return make_error(None, -32600, "invalid request: expected a JSON object")
     method = msg.get("method")
     rid = msg.get("id")
+    if not isinstance(method, str):
+        return make_error(rid, -32600, "invalid request: method must be a string")
+    params = msg.get("params")
+    if params is None:
+        params = {}
+    if not isinstance(params, dict):
+        return make_error(rid, -32602, "invalid params: expected a JSON object")
     if method == "initialize":
         return make_result(rid, {
-            "protocolVersion": msg.get("params", {}).get("protocolVersion", "2024-11-05"),
+            "protocolVersion": params.get("protocolVersion", "2024-11-05"),
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}})
     if method == "notifications/initialized":
@@ -212,9 +234,14 @@ def handle(msg: dict) -> dict | None:
             {"name": name, "description": t["description"], "inputSchema": t["inputSchema"]}
             for name, t in TOOLS.items()]})
     if method == "tools/call":
-        params = msg.get("params", {})
         name = params.get("name")
-        args = params.get("arguments", {}) or {}
+        args = params.get("arguments")
+        if args is None:
+            args = {}
+        if not isinstance(name, str):
+            return make_error(rid, -32602, "invalid params: name must be a string")
+        if not isinstance(args, dict):
+            return make_error(rid, -32602, "invalid params: arguments must be a JSON object")
         tool = TOOLS.get(name)
         if not tool:
             return make_error(rid, -32602, f"unknown tool: {name}")
@@ -227,6 +254,15 @@ def handle(msg: dict) -> dict | None:
             return make_result(rid, {"content": [{"type": "text", "text": f"error: {exc}"}],
                                      "isError": True})
     return make_error(rid, -32601, f"method not found: {method}")
+
+
+def _dispatch(msg) -> dict | None:
+    """Transport guard: no unexpected exception may kill the server loop."""
+    try:
+        return handle(msg)
+    except Exception as exc:  # noqa: BLE001
+        rid = msg.get("id") if isinstance(msg, dict) else None
+        return make_error(rid, -32603, f"internal error: {exc}")
 
 
 def serve_http(port: int = 8766) -> None:
@@ -256,7 +292,7 @@ def serve_http(port: int = 8766) -> None:
                 msg = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:
                 return self._send(400, make_error(None, -32700, "parse error"))
-            reply = handle(msg)
+            reply = _dispatch(msg)
             if reply is None:
                 return self._send(202, {"status": "accepted"})
             self._send(200, reply)
@@ -303,7 +339,7 @@ def main() -> None:
         except json.JSONDecodeError:
             print(json.dumps(make_error(None, -32700, "parse error")), flush=True)
             continue
-        reply = handle(msg)
+        reply = _dispatch(msg)
         if reply is not None:
             print(json.dumps(reply, ensure_ascii=False), flush=True)
 
