@@ -216,6 +216,11 @@ def mono_cancel_db(stereo: np.ndarray) -> float:
 
 
 def clipping(stereo: np.ndarray, thr: float = 0.999) -> dict:
+    """Clipped FRAMES, not channel samples.
+
+    A frame counts once even when both channels clip, so the proportion gate's
+    denominator is duration * sample_rate, independent of channel count.
+    """
     hits = np.abs(stereo) >= thr
     return {"count": int(hits.any(axis=1).sum()) if hits.ndim > 1 else int(hits.sum())}
 

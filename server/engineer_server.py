@@ -19,7 +19,7 @@ except ImportError:  # executed as a script: python server/engineer_server.py
     from jev import ask, config
 
 SERVER_NAME = "mcp_sound_engineer"
-SERVER_VERSION = "0.6.0"
+SERVER_VERSION = "0.6.1"
 
 # Jev schemas live in rules.py: one source of truth for the answer keys.
 MASTER_QUESTIONS = rules.MASTER_QUESTIONS
@@ -94,7 +94,11 @@ def tool_judge_master(path: str, platform: str = "spotify",
         warnings.append(f"low confidence on {sorted(confidence['low'])}; treat the recipe as a draft")
     if previous_path:
         drop = rules.correlation_drop(analyze_master(previous_path), facts)
-        if drop["exceeds"]:
+        if drop.get("unmeasured"):
+            warnings.append(f"phase correlation could not be compared "
+                            f"({', '.join(drop['unmeasured'])} unmeasured); the drop after "
+                            f"the chain is unknown, not zero")
+        elif drop["exceeds"]:
             warnings.append(f"phase correlation dropped {drop['drop']} after the chain "
                             f"({drop['before']} -> {drop['after']}); check the last stage added")
     return {"facts": facts, "answers": answers, "recipe": recipe,
@@ -111,7 +115,7 @@ def tool_judge_mix(paths: list[str]) -> dict:
     answers = ask(state, MIX_QUESTIONS)
     names = [s["path"] for s in facts["stems"]]
     confidence = rules.confidence_report(answers)
-    warnings = rules.mix_warnings(answers, names)
+    warnings = rules.mix_warnings(answers, names, facts["stems"])
     if confidence["needs_human"]:
         warnings.append(f"low confidence on {sorted(confidence['low'])}; treat the recipe as a draft")
     warnings += [f"{g['gate']}: {g}" for g in facts.get("gates", [])]

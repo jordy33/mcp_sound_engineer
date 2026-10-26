@@ -15,7 +15,7 @@ import math
 import os
 import re
 
-RULES_VERSION = "2.1.0"
+RULES_VERSION = "2.1.1"
 RECIPE_SCHEMA_VERSION = "2.1.0"
 
 # --- Gates: when to refuse to master a mix -----------------------------------
@@ -156,9 +156,34 @@ GAIN_STAGING_TARGET_LUFS = -18.0
 GAIN_STAGING_MAX_MOVE_DB = 6.0
 CONFIDENCE_MIN = 0.5
 
+# Jev answers a `score` question on a saturating 2-10 scale (five criterion
+# levels). The scale is abstract: every use must name the physical range it maps
+# onto. Values outside the scale clamp to the ends of that range.
+SCORE_MIN = 2.0
+SCORE_MAX = 10.0
+
+# PRODUCT RULE: masking at or below this score needs no corrective bell; above it
+# the requested cut grows 1:1 with the score, capped by GATE.
+MASKING_SCORE_BASE = 2.0
+MASKING_SCORE_THRESHOLD = 2.5
+
 
 def clamp(value: float, lo: float, hi: float) -> float:
     return max(lo, min(hi, value))
+
+
+def map_score(score: float, low: float, high: float) -> float:
+    """Map a 2-10 decision score linearly onto `low..high`.
+
+    A saturated score cannot exceed the cap, and a score below the scale's floor
+    cannot invent a move smaller than the range's floor. Raises on non-numeric
+    input instead of defaulting to zero.
+    """
+    value = _number(score)
+    if value is None:
+        raise ValueError(f"score must be numeric, got {score!r}")
+    fraction = clamp((value - SCORE_MIN) / (SCORE_MAX - SCORE_MIN), 0.0, 1.0)
+    return low + fraction * (high - low)
 
 
 def loudness_target(platform: str) -> dict:
@@ -182,12 +207,22 @@ def require(answers: dict, questions: dict) -> None:
         raise ValueError(f"answers without the expected field: {malformed}")
 
 
-def _noul(answers, name, default=0.0):
-    return float(answers.get(name, {}).get("noul", default))
+def _number(value):
+    """A finite float, or None. Booleans are not measurements."""
+    if isinstance(value, bool) or not isinstance(value, (int, float)):
+        return None
+    number = float(value)
+    return number if math.isfinite(number) else None
 
 
-def _score(answers, name, default=0.0):
-    return float(answers.get(name, {}).get("score", default))
+def _count(value):
+    """A non-negative count, or None."""
+    number = _number(value)
+    return number if number is not None and number >= 0 else None
+
+
+def _score(answers, name):
+    return float(answers[name]["score"])
 
 
 def _choice(answers, name, default=""):
@@ -214,39 +249,88 @@ MAX_LRA_FINISHED = 4.0
 def evaluate_gates(facts: dict) -> dict:
     """Refuse mastering, and say exactly why. Every condition here is measured.
 
+    A gate whose input is absent is NOT treated as healthy: the missing field is
+    reported as `unmeasured:<field>` and the result is a refusal. There is no
+    "default to a safe-looking number" path. The one exception is
+    `noise.floor_dbfs: null`, which is itself a measurement: it means the file
+    has no silence in which to measure a floor.
+
     The decision model is deliberately NOT asked whether to refuse: a global yes/no
     duplicates the detailed scores and contradicts them when they disagree.
     """
     reasons: list[str] = []
+    unmeasured: list[str] = []
+    facts = facts if isinstance(facts, dict) else {}
 
-    stereo = facts.get("stereo") or {}
-    if float(stereo.get("phase_correlation", 1.0)) < GATE["min_phase_correlation"]:
+    stereo = facts.get("stereo")
+    stereo = stereo if isinstance(stereo, dict) else {}
+    phase = _number(stereo.get("phase_correlation"))
+    if phase is None:
+        unmeasured.append("stereo.phase_correlation")
+    elif phase < GATE["min_phase_correlation"]:
         reasons.append("phase_problem:measured")
 
-    loud = facts.get("loudness") or {}
-    clipping = facts.get("clipping") or {}
-    clipped = int(clipping.get("count", 0))
-    frames = float(facts.get("duration_seconds", 0)) * float(facts.get("sample_rate", 1)) or 1.0
-    if clipped >= MIN_CLIPPED_SAMPLES and (clipped / frames) >= MIN_CLIPPED_PROPORTION:
-        reasons.append("clipped:measured")
+    loud = facts.get("loudness")
+    loud = loud if isinstance(loud, dict) else {}
+    clipping = facts.get("clipping")
+    clipping = clipping if isinstance(clipping, dict) else {}
+    # `count` is stereo FRAMES, not channel samples: analysis.clipping counts a
+    # frame once even when both channels clip, so duration * sample_rate is the
+    # correct denominator regardless of channel count.
+    clipped = _count(clipping.get("count"))
+    duration = _number(facts.get("duration_seconds"))
+    sample_rate = _number(facts.get("sample_rate"))
+    if clipped is None:
+        unmeasured.append("clipping.count")
+    if duration is None or duration <= 0:
+        unmeasured.append("duration_seconds")
+    if sample_rate is None or sample_rate <= 0:
+        unmeasured.append("sample_rate")
+    if clipped is not None and duration and sample_rate:
+        frames = duration * sample_rate
+        if clipped >= MIN_CLIPPED_SAMPLES and (clipped / frames) >= MIN_CLIPPED_PROPORTION:
+            reasons.append("clipped:measured")
 
-    noise = facts.get("noise") or {}
-    floor = noise.get("floor_dbfs")
-    if floor is not None and float(floor) > GATE["noise_floor_moderate_db"]:
-        reasons.append("noise_floor:measured")
+    noise = facts.get("noise")
+    if not isinstance(noise, dict) or "floor_dbfs" not in noise:
+        unmeasured.append("noise.floor_dbfs")
+    elif noise.get("floor_dbfs") is not None:
+        floor = _number(noise.get("floor_dbfs"))
+        if floor is None:
+            unmeasured.append("noise.floor_dbfs")
+        elif floor > GATE["noise_floor_moderate_db"]:
+            reasons.append("noise_floor:measured")
 
-    bandwidth = facts.get("bandwidth") or {}
-    if (bandwidth.get("lossy_suspected")
-            or float(bandwidth.get("drop_db") or 0.0) > GATE["lossy_shelf_drop_db"]):
-        reasons.append("lossy_source:measured")
+    bandwidth = facts.get("bandwidth")
+    if not isinstance(bandwidth, dict) or not (
+            "lossy_suspected" in bandwidth or "drop_db" in bandwidth):
+        unmeasured.append("bandwidth")
+    else:
+        suspected = bandwidth.get("lossy_suspected")
+        drop = _number(bandwidth.get("drop_db"))
+        if "lossy_suspected" in bandwidth and not isinstance(suspected, bool):
+            unmeasured.append("bandwidth.lossy_suspected")
+        if "drop_db" in bandwidth and drop is None:
+            unmeasured.append("bandwidth.drop_db")
+        if suspected is True or (drop is not None and drop > GATE["lossy_shelf_drop_db"]):
+            reasons.append("lossy_source:measured")
 
     # PRODUCT RULE (not in the source): a finished master cannot be mastered again.
-    if (float(loud.get("loudness_range_lu", 99)) < MAX_LRA_FINISHED
-            and float(loud.get("true_peak_dbtp", -99)) > -1.0
-            and float(loud.get("integrated_lufs", -99)) > -12.0):
+    lra = _number(loud.get("loudness_range_lu"))
+    true_peak = _number(loud.get("true_peak_dbtp"))
+    integrated = _number(loud.get("integrated_lufs"))
+    for field, value in (("loudness_range_lu", lra),
+                         ("true_peak_dbtp", true_peak),
+                         ("integrated_lufs", integrated)):
+        if value is None:
+            unmeasured.append("loudness." + field)
+    if (lra is not None and true_peak is not None and integrated is not None
+            and lra < MAX_LRA_FINISHED and true_peak > -1.0 and integrated > -12.0):
         reasons.append("already_mastered:measured")
 
-    return {"send_back": bool(reasons), "reasons": reasons}
+    reasons.extend("unmeasured:" + field for field in unmeasured)
+    return {"send_back": bool(reasons), "reasons": reasons,
+            "unmeasured": unmeasured, "complete": not unmeasured}
 
 
 def loudness_warnings(facts: dict, target: dict) -> list[str]:
@@ -393,8 +477,9 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
 
     # Dynamics before sibilance: the de-esser belongs to the dynamic stage, after compression.
     if _choice(answers, "dynamics") == "glue":
-        gr = clamp(0.5 + 0.5 * _score(answers, "dynamics_amount"),
-                   GATE["min_gain_reduction_db"], GATE["max_gain_reduction_db"])
+        # The score is abstract; name the physical range instead of treating it as dB.
+        gr = map_score(_score(answers, "dynamics_amount"),
+                       GATE["min_gain_reduction_db"], GATE["max_gain_reduction_db"])
         recipe.append(_action("compressor", target="master", ratio=2.0, attack_ms=20,
                               release_ms=200, gain_reduction_db=round(gr, 1)))
     elif _choice(answers, "dynamics") == "expand":
@@ -439,11 +524,24 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
 
 
 def correlation_drop(before: dict, after: dict, limit: float = 0.15) -> dict:
-    """The source's post-chain check: cumulative phase rotation must not eat the image."""
-    b = float((before.get("stereo") or {}).get("phase_correlation", 1.0))
-    a = float((after.get("stereo") or {}).get("phase_correlation", 1.0))
+    """The source's post-chain check: cumulative phase rotation must not eat the image.
+
+    Missing correlation on either side is reported as unmeasured, never as a
+    healthy 1.0 that makes the drop look like zero.
+    """
+    before_stereo = before.get("stereo") if isinstance(before, dict) else None
+    after_stereo = after.get("stereo") if isinstance(after, dict) else None
+    b = _number((before_stereo if isinstance(before_stereo, dict) else {})
+                .get("phase_correlation"))
+    a = _number((after_stereo if isinstance(after_stereo, dict) else {})
+                .get("phase_correlation"))
+    unmeasured = [side for side, value in (("before", b), ("after", a)) if value is None]
+    if unmeasured:
+        return {"before": b, "after": a, "drop": None, "exceeds": False,
+                "unmeasured": unmeasured}
     drop = round(b - a, 3)
-    return {"before": b, "after": a, "drop": drop, "exceeds": drop > limit}
+    return {"before": b, "after": a, "drop": drop, "exceeds": drop > limit,
+            "unmeasured": []}
 
 
 def _limiter_violations(action: dict, index: int) -> list[dict]:
@@ -518,7 +616,8 @@ def confidence_report(answers: dict, threshold: float = CONFIDENCE_MIN) -> dict:
     return {"threshold": threshold, "low": low, "needs_human": bool(low)}
 
 
-def mix_warnings(answers: dict, stems: list[str]) -> list[str]:
+def mix_warnings(answers: dict, stems: list[str],
+                 stem_facts: list[dict] | None = None) -> list[str]:
     """Say out loud when a decision cannot be applied to the exported files."""
     out: list[str] = []
     balance = _choice(answers, "balance")
@@ -527,6 +626,26 @@ def mix_warnings(answers: dict, stems: list[str]) -> list[str]:
     if role and not _match_stem(stems, role):
         out.append(f"no exported stem matches {role!r}; the fader move was omitted "
                    f"(stems: {[s.split('/')[-1] for s in stems]})")
+
+    masking = _score(answers, "masking")
+    requested = masking - MASKING_SCORE_BASE
+    if masking >= MASKING_SCORE_THRESHOLD and requested > GATE["max_corrective_db_per_point"]:
+        out.append(f"masking score {masking:g} asks for {round(requested, 1)} dB at 300 Hz, "
+                   f"above the {GATE['max_corrective_db_per_point']} dB corrective cap; the "
+                   f"bell is capped and the remaining imbalance is structural, not EQ-shaped")
+
+    for stem in stem_facts or []:
+        path = str(stem.get("path", ""))
+        name = os.path.basename(path) or path
+        lufs = _number(stem.get("integrated_lufs"))
+        if lufs is None:
+            out.append(f"{name}: loudness was not measured; no gain-staging move was planned")
+            continue
+        needed = GAIN_STAGING_TARGET_LUFS - lufs
+        if abs(needed) > GAIN_STAGING_MAX_MOVE_DB:
+            out.append(f"{name} needs {round(needed, 1):+g} dB to reach "
+                       f"{GAIN_STAGING_TARGET_LUFS} LUFS; the fader is capped at "
+                       f"±{GAIN_STAGING_MAX_MOVE_DB} dB — check the gain structure upstream")
     return out
 
 
@@ -546,12 +665,18 @@ def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | N
             recipe.append(_action("fader", target=target, gain_db=clamp(gain, -3.0, 3.0),
                                   stem=stem))
     masking = _score(answers, "masking")
-    if masking >= 2.5:
+    if masking >= MASKING_SCORE_THRESHOLD:
+        # Over-cap requests are capped, and mix_warnings names the cap so the
+        # hidden imbalance is not silently presented as an EQ-shaped problem.
+        cut = clamp(masking - MASKING_SCORE_BASE, 0.0,
+                    GATE["max_corrective_db_per_point"])
         recipe.append(_action("eq.bell", target="bus", freq_hz=300,
-                              gain_db=-clamp(masking - 2.0, 0.0, 3.0), q=4.0, role="corrective"))
+                              gain_db=-cut, q=4.0, role="corrective"))
     # Gain staging is arithmetic, not taste: bring every stem toward -18 LUFS.
     for stem in stem_facts or []:
-        lufs = float(stem.get("integrated_lufs", GAIN_STAGING_TARGET_LUFS))
+        lufs = _number(stem.get("integrated_lufs"))
+        if lufs is None:
+            continue   # unmeasured, not a healthy -18 LUFS
         move = clamp(GAIN_STAGING_TARGET_LUFS - lufs, -GAIN_STAGING_MAX_MOVE_DB,
                      GAIN_STAGING_MAX_MOVE_DB)
         if abs(move) >= 1.0:

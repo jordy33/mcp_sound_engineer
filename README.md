@@ -109,16 +109,19 @@ one source of truth for both the numbers and the answer keys.
 | Rule | Value | In code | Behaviour |
 |---|---|---|---|
 | Phase correlation | < +0.3 | `GATE.min_phase_correlation` | **measured** → `send_back` |
-| Clipping that blocks mastering | ≥ 500 frames **and** ≥ 0.01 % | `MIN_CLIPPED_*` | **measured** → `send_back` |
+| Missing gate input | any of phase, clipping count/duration/sample rate, LRA/TP/LUFS, bandwidth | `evaluate_gates` | **not measured** → `unmeasured:<field>` and `send_back`; no healthy defaults |
+| Clipping that blocks mastering | ≥ 500 frames **and** ≥ 0.01 % | `MIN_CLIPPED_*` | **measured** → `send_back`; `count` is stereo frames, so the denominator is duration × sample rate |
 | Already a finished master | LRA < 4 **and** TP > −1 **and** LUFS > −12 | `MAX_LRA_FINISHED` | **measured** → `send_back` (product rule) |
 | Corrective EQ per point | ≤ 3 dB | `GATE.max_corrective_db_per_point` | over the cap → `send_back`, never clamped |
 | Cumulative corrective EQ | ≤ 6 dB | `GATE.max_cumulative_corrective_db` | includes the sibilance cut |
+| Masking (mix) | score 2–10, cut starts above 2 | `MASKING_*`, `GATE.max_corrective_db_per_point` | bell capped at −3 dB; `mix_warnings` names the structural remainder instead of hiding it |
 | Total gain reduction | ≤ 6 dB (source range 6–8) | `GATE.max_total_gain_reduction_db` | compressor + limiter summing over budget → `send_back` |
 | Mono compatibility | fold-down loss < 6 dB | `GATE.min_mono_cancel_db` | warning with the measured loss |
-| Gain staging (mix) | every stem toward −18 LUFS | `GAIN_STAGING_*` | deterministic faders, ±6 dB max |
+| Gain staging (mix) | every stem toward −18 LUFS | `GAIN_STAGING_*` | deterministic faders, ±6 dB max; a capped move or unmeasured loudness is warned |
 | Phase before EQ (mix) | correlation < +0.3 | `phase_before_eq` | `polarity.invert` or `eq.high_pass_stem` |
 | Confidence | < 0.5 | `CONFIDENCE_MIN` | `confidence.needs_human` + warning; the recipe is a draft |
 | Broadband compression | 1.5–3:1, 10–30 ms, 1–3 dB GR | `CHAIN`, `GATE.min/max_gain_reduction_db` | emitted on the master bus |
+| Dynamics amount | abstract score 2–10 | `map_score` | linear 2→1 dB, 6→2 dB, 10→3 dB; outside the scale clamps, never interpreted as dB |
 | De-esser | after compression | `CHAIN` | emitted after the compressor |
 | Limiter | GR = max(0, tp + input_gain − ceiling); ceiling from the destination | `plan_limiter` | input gain = min(loudness request, peak budget); `expected_gain_reduction_db` is a prediction, not a control |
 | Pre-limiter trim | ≤ 3 dB; more than 7 dB over the ceiling → `send_back` | `GATE.max_limiter_input_trim_db` | a peak that 4 dB GR + 3 dB input trim cannot fix is not a mastering problem |
@@ -126,7 +129,7 @@ one source of truth for both the numbers and the answer keys.
 | Playback normalization | Spotify −14, Apple −16, … | `PLATFORMS` | informational; never a delivery target |
 | Unknown destination | — | `loudness_target` | raises, no silent fallback |
 | Reference curve | measured from a real track when `reference_path` is given, normalized default otherwise | `analyze_reference`, `REFERENCE_CURVE` | linear sum = 1.0 for the default; a partial measured curve fails loud |
-| Correlation drop after the chain | > 0.15 | `correlation_drop` | warning when `previous_path` is given |
+| Correlation drop after the chain | > 0.15 | `correlation_drop` | warning when `previous_path` is given; missing correlation on either side is reported unmeasured, not as a zero drop |
 | Sibilance | 5–9 kHz relative to full-band energy | `analysis.SIBILANCE_BAND` | measured as `spectral.sibilance_db_rel`; informs the question, not a de-esser threshold |
 | Noise floor | > −50 dB; minor between −60 and −50 | `GATE.noise_floor_moderate_db`, `GATE.noise_floor_minor_db` | **measured in silence only**; > −50 → `send_back`, > −60 → warning; `None` when the file has no gap |
 | Lossy source | cliff > 20 dB between 14–16 k and 16–18 k | `GATE.lossy_shelf_drop_db` | **measured** (suspected flag or measured drop) → `send_back` |
@@ -139,16 +142,21 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 262 tests: smoke + rules + analysis + adapter + loop
+./start-sound-engineer-mcp.sh --test     # 275 tests: smoke + rules + analysis + adapter + loop
 ```
 
 `tests/test_rules.py` asserts behaviour, plus the limiter's two-constraint arithmetic:
 
 * every balance label lowers the offender, and a fader points at a real exported stem;
-* a corrective request above 3 dB returns `send_back` instead of a clamped band;
-* 60 clipped frames in 10 s do **not** send back, 5000 do;
+* a corrective request above 3 dB returns `send_back` instead of a clamped band, and the
+  cumulative cap counts the sibilance cut (7.5 dB → `send_back`, no zero-gain bell);
+* corrective bells use Q 4–8;
+* 60 clipped frames in 10 s do **not** send back, 5000 do, and 5 frames in 1 s do not;
+* a missing gate input is `unmeasured:<field>` and a terminal `send_back`, never a
+  healthy default;
 * the limiter's input gain is min(requested loudness, peak budget), and the peak-only
   default never invents input gain;
+* the abstract dynamics score maps explicitly onto 1–3 dB GR (`map_score`);
 * `dither` never appears for a streaming destination;
 * the two recipe builders reject any answer key missing from their schema (this is the test that
   catches a `low_end` / `low_mid` mismatch);
@@ -276,7 +284,7 @@ sensitivity to a known change, not agreement with a trained ear.
 
 ## 8. Status
 
-`0.6.0` (rules 2.1.0). Measurement, gates, sections, references, the recipe contract and a
+`0.6.1` (rules 2.1.1). Measurement, gates, sections, references, the recipe contract and a
 closed apply → export → measure → iterate loop are in place, with CI on 3.9/3.11/3.12. What is
 still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
 

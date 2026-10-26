@@ -31,6 +31,8 @@ def _master_facts(lufs: float = -18.0, tp: float = -1.0, **extra):
     base = {"loudness": {"integrated_lufs": lufs, "true_peak_dbtp": tp,
                          "loudness_range_lu": 9.0},
             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
+            "noise": {"floor_dbfs": None},
+            "bandwidth": {"lossy_suspected": False, "drop_db": 0.0},
             "duration_seconds": 60, "sample_rate": 44100}
     base.update(extra)
     return base
@@ -78,42 +80,84 @@ def test_every_gate_is_classified():
 
 
 def test_send_back_is_terminal_and_attributed():
-    facts = {"loudness": {"loudness_range_lu": 2.0, "true_peak_dbtp": -0.2, "integrated_lufs": -9.5},
-             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
-             "duration_seconds": 10, "sample_rate": 48000}
+    facts = _master_facts(-9.5, -0.2, loudness={"loudness_range_lu": 2.0,
+                                               "true_peak_dbtp": -0.2,
+                                               "integrated_lufs": -9.5},
+                          duration_seconds=10, sample_rate=48000)
     recipe = rules.build_master_recipe(_answers(), facts, "spotify")
     assert len(recipe) == 1 and recipe[0]["action"] == "send_back"
     assert "already_mastered:measured" in recipe[0]["reasons"]
 
 
 def test_a_few_overs_do_not_send_back():
-    """500 samples or 0.01 % must BOTH be met, otherwise a 10 s file trips on 44."""
-    facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -1.0, "integrated_lufs": -18.0},
-             "stereo": {"phase_correlation": 0.8}, "clipping": {"count": 60},
-             "duration_seconds": 10, "sample_rate": 44100}
+    """500 frames or 0.01 % must BOTH be met, otherwise a 10 s file trips on 44."""
+    facts = _master_facts(-18.0, -1.0, clipping={"count": 60},
+                          duration_seconds=10, sample_rate=44100)
     gates = rules.evaluate_gates(facts)
     assert not gates["send_back"], gates
 
 
+def test_a_handful_of_overs_in_a_short_file_does_not_send_back():
+    """0.01 % of 1 s is 4.41 frames, but the 500-frame floor still has to be met."""
+    facts = _master_facts(-18.0, -1.0, clipping={"count": 5},
+                          duration_seconds=1, sample_rate=44100)
+    assert not rules.evaluate_gates(facts)["send_back"]
+
+
 def test_sustained_clipping_does_send_back():
-    facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -0.5, "integrated_lufs": -14.0},
-             "stereo": {"phase_correlation": 0.8}, "clipping": {"count": 5000},
-             "duration_seconds": 10, "sample_rate": 44100}
+    facts = _master_facts(-14.0, -0.5, clipping={"count": 5000},
+                          duration_seconds=10, sample_rate=44100)
     assert rules.evaluate_gates(facts)["send_back"]
 
 
 def test_noise_floor_gate():
-    facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -1.0, "integrated_lufs": -18.0},
-             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
-             "noise": {"floor_dbfs": -40.0}, "duration_seconds": 200, "sample_rate": 44100}
+    facts = _master_facts(-18.0, -1.0, noise={"floor_dbfs": -40.0},
+                          duration_seconds=200)
     assert "noise_floor:measured" in rules.evaluate_gates(facts)["reasons"]
 
 
 def test_lossy_source_gate():
-    facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -1.0, "integrated_lufs": -18.0},
-             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
-             "bandwidth": {"lossy_suspected": True}, "duration_seconds": 200, "sample_rate": 44100}
+    facts = _master_facts(-18.0, -1.0, bandwidth={"lossy_suspected": True,
+                                                  "drop_db": 0.0},
+                          duration_seconds=200)
     assert "lossy_source:measured" in rules.evaluate_gates(facts)["reasons"]
+
+
+def test_missing_gate_inputs_are_unmeasured_not_healthy():
+    """An absent measurement must not be defaulted to a safe-looking number."""
+    facts = _master_facts()
+    del facts["stereo"]["phase_correlation"]
+    del facts["loudness"]["loudness_range_lu"]
+    del facts["clipping"]["count"]
+    del facts["bandwidth"]
+    gates = rules.evaluate_gates(facts)
+    assert gates["send_back"] is True, gates
+    assert gates["complete"] is False, gates
+    assert set(gates["unmeasured"]) == {
+        "stereo.phase_correlation", "loudness.loudness_range_lu",
+        "clipping.count", "bandwidth"}, gates
+    assert "unmeasured:stereo.phase_correlation" in gates["reasons"]
+
+
+def test_noise_floor_none_means_no_silence_not_unmeasured():
+    facts = _master_facts(noise={"floor_dbfs": None})
+    gates = rules.evaluate_gates(facts)
+    assert gates["complete"] is True, gates
+    assert "unmeasured:noise.floor_dbfs" not in gates["reasons"], gates
+
+
+def test_unmeasured_gate_turns_the_recipe_into_a_terminal_send_back():
+    facts = _master_facts()
+    del facts["stereo"]["phase_correlation"]
+    recipe = rules.build_master_recipe(_answers(), facts, "spotify")
+    assert len(recipe) == 1 and recipe[0]["action"] == "send_back", recipe
+    assert "unmeasured:stereo.phase_correlation" in recipe[0]["reasons"], recipe
+
+
+def test_correlation_drop_is_not_invented_when_unmeasured():
+    drop = rules.correlation_drop({"stereo": {}}, {"stereo": {"phase_correlation": 0.8}})
+    assert drop["drop"] is None and drop["exceeds"] is False, drop
+    assert drop["unmeasured"] == ["before"], drop
 
 
 def test_mix_warns_when_no_stem_matches():
@@ -125,24 +169,26 @@ def test_mix_warns_when_no_stem_matches():
 
 
 def test_unmastered_mix_is_not_sent_back():
-    facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -1.0, "integrated_lufs": -18.0},
-             "stereo": {"phase_correlation": 0.8}, "clipping": {"count": 3},
-             "duration_seconds": 200, "sample_rate": 44100}
+    facts = _master_facts(-18.0, -1.0, stereo={"phase_correlation": 0.8},
+                          clipping={"count": 3}, duration_seconds=200)
     assert not rules.evaluate_gates(facts)["send_back"]
 
 
 # --- corrective EQ: over the cap is a send-back, never a clamp ---------------
 def test_corrective_within_cap_is_applied():
-    recipe = rules.build_master_recipe(_answers(low_end={"score": 3.0}, high_mid={"score": 3.0}),
-                                       {}, "spotify")
+    recipe = rules.build_master_recipe(
+        _answers(low_end={"score": 3.0}, high_mid={"score": 3.0}),
+        _master_facts(), "spotify")
     bells = [a for a in recipe if a["action"] == "eq.bell"]
     assert {a["measured_from"] for a in bells} == {"low_end", "high_mid"}
     for a in bells:
         assert abs(a["gain_db"]) <= rules.GATE["max_corrective_db_per_point"]
+        assert 4.0 <= a["q"] <= 8.0, a
 
 
 def test_corrective_beyond_cap_sends_back():
-    recipe = rules.build_master_recipe(_answers(low_end={"score": 4.0}), {}, "spotify")
+    recipe = rules.build_master_recipe(
+        _answers(low_end={"score": 4.0}), _master_facts(), "spotify")
     assert recipe[0]["action"] == "send_back"
     assert any("corrective_beyond_cap" in r for r in recipe[0]["reasons"])
 
@@ -150,9 +196,18 @@ def test_corrective_beyond_cap_sends_back():
 def test_cumulative_corrective_includes_the_sibilance_cut():
     answers = _answers(low_end={"score": 3.5}, high_mid={"score": 3.5},
                        sibilance={"choice": "cut"})
-    recipe = rules.build_master_recipe(answers, {}, "spotify")
+    recipe = rules.build_master_recipe(answers, _master_facts(), "spotify")
     assert recipe[0]["action"] == "send_back"
-    assert any("cumulative" in r for r in recipe[0]["reasons"])
+    assert "corrective_beyond_cap:cumulative:7.5dB" in recipe[0]["reasons"], recipe
+    assert all(a["action"] != "eq.bell" for a in recipe), recipe
+
+
+def test_sibilance_cut_alone_stays_within_the_q_range():
+    recipe = rules.build_master_recipe(
+        _answers(sibilance={"choice": "cut"}), _master_facts(), "spotify")
+    bell = next(a for a in recipe if a["action"] == "eq.bell")
+    assert bell["freq_hz"] == 7000 and 4.0 <= bell["q"] <= 8.0, bell
+    assert bell["gain_db"] != 0.0, bell
 
 
 # --- limiter: two constraints, arithmetic instead of model opinion ----------
@@ -240,14 +295,20 @@ def test_limiter_action_carries_the_contract_fields():
     assert "target_lufs" not in lim
 
 
-def test_limiter_action_survives_missing_measurements():
+def test_missing_measurements_send_back_instead_of_inventing_a_limiter():
     for facts in ({}, {"spectral": {"bands_db_rel": {}}},
                   {"loudness": {"integrated_lufs": -18.0}}):
-        lim = _limiter(rules.build_master_recipe(_answers(), facts, "spotify"))
-        assert lim["input_gain_db"] == 0.0, (facts, lim)
-        assert lim["expected_gain_reduction_db"] == 0.0, (facts, lim)
-        assert lim["loudness_reached"] is True, (facts, lim)
-        assert lim["approx_lufs_after"] is None and lim["plr_db"] is None, (facts, lim)
+        recipe = rules.build_master_recipe(_answers(), facts, "spotify")
+        assert len(recipe) == 1 and recipe[0]["action"] == "send_back", (facts, recipe)
+        assert any(r.startswith("unmeasured:") for r in recipe[0]["reasons"]), recipe
+
+
+def test_neutral_limiter_plan_is_the_fallback_for_missing_loudness():
+    plan = rules._limiter_plan({}, rules.PLATFORMS["spotify"], None)
+    assert plan["input_gain_db"] == 0.0, plan
+    assert plan["expected_gain_reduction_db"] == 0.0, plan
+    assert plan["loudness_reached"] is True, plan
+    assert plan["approx_lufs_after"] is None and plan["plr_db"] is None, plan
 
 
 def test_limiter_trim_is_emitted():
@@ -275,32 +336,60 @@ def test_limiter_no_name_error_with_mono_or_noise_facts():
 
 
 def test_dither_only_for_fixed_bit_depth_destinations():
-    spotify = rules.build_master_recipe(_answers(), {}, "spotify")
-    cd = rules.build_master_recipe(_answers(), {}, "cd")
+    spotify = rules.build_master_recipe(_answers(), _master_facts(), "spotify")
+    cd = rules.build_master_recipe(_answers(), _master_facts(), "cd")
     assert all(a["action"] != "dither" for a in spotify), spotify
     assert cd[-1]["action"] == "dither" and cd[-1]["bit_depth"] == 16
+
+
+def test_streaming_platform_never_emits_dither_even_from_16_bit_source():
+    facts = _master_facts(bit_depth=16)
+    for platform in ("spotify", "apple_music", "youtube", "amazon", "tidal"):
+        recipe = rules.build_master_recipe(_answers(), facts, platform)
+        assert all(a["action"] != "dither" for a in recipe), (platform, recipe)
+
+
+def test_platform_dither_type_wins():
+    cd = rules.build_master_recipe(_answers(), _master_facts(), "cd")
+    assert cd[-1]["type"] == rules.PLATFORMS["cd"]["dither"]
 
 
 # --- ordering ---------------------------------------------------------------
 def test_compressor_precedes_de_esser():
     answers = _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 2.0},
                        sibilance={"choice": "deess"})
-    order = [a["action"] for a in rules.build_master_recipe(answers, {}, "spotify")]
+    order = [a["action"] for a in rules.build_master_recipe(
+        answers, _master_facts(), "spotify")]
     assert order.index("compressor") < order.index("de_esser"), order
 
 
 def test_compressor_targets_the_master_in_a_mastering_recipe():
     answers = _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 2.0})
-    comp = next(a for a in rules.build_master_recipe(answers, {}, "spotify")
-                if a["action"] == "compressor")
+    comp = next(a for a in rules.build_master_recipe(
+        answers, _master_facts(), "spotify") if a["action"] == "compressor")
     assert comp["target"] == "master", comp
 
 
 def test_gain_reduction_respects_the_source_range():
     answers = _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 0.0})
-    comp = next(a for a in rules.build_master_recipe(answers, {}, "spotify")
-                if a["action"] == "compressor")
+    comp = next(a for a in rules.build_master_recipe(
+        answers, _master_facts(), "spotify") if a["action"] == "compressor")
     assert comp["gain_reduction_db"] >= rules.GATE["min_gain_reduction_db"]
+
+
+def test_abstract_scores_map_explicitly_onto_the_gain_reduction_range():
+    low, high = rules.GATE["min_gain_reduction_db"], rules.GATE["max_gain_reduction_db"]
+    assert rules.map_score(2.0, low, high) == low
+    assert rules.map_score(6.0, low, high) == 2.0
+    assert rules.map_score(10.0, low, high) == high
+    assert rules.map_score(0.0, low, high) == low       # below the scale
+    assert rules.map_score(12.0, low, high) == high     # saturated
+    for score, expected in ((2.0, 1.0), (4.0, 1.5), (6.0, 2.0),
+                            (8.0, 2.5), (10.0, 3.0)):
+        comp = next(a for a in rules.build_master_recipe(
+            _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": score}),
+            _master_facts(), "spotify") if a["action"] == "compressor")
+        assert comp["gain_reduction_db"] == expected, (score, comp)
 
 
 # --- mix half ---------------------------------------------------------------
@@ -372,10 +461,8 @@ def test_validate_recipe_rejects_unknown_action_and_schema():
 
 
 def test_validate_recipe_accepts_a_good_recipe():
-    facts = {"loudness": {"loudness_range_lu": 11.0, "true_peak_dbtp": -1.0, "integrated_lufs": -18.0},
-             "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
-             "duration_seconds": 200, "sample_rate": 44100}
-    good = rules.build_master_recipe(_answers(), facts, "spotify")
+    good = rules.build_master_recipe(
+        _answers(), _master_facts(-18.0, -1.0, duration_seconds=200), "spotify")
     assert rules.validate_recipe(good) == [], good
 
 
@@ -443,10 +530,10 @@ def test_noise_floor_minor_is_implemented():
 
 
 def test_lossy_gate_uses_the_gate_constant():
-    over = {"bandwidth": {"drop_db": rules.GATE["lossy_shelf_drop_db"] + 0.5,
-                          "lossy_suspected": False}}
-    at = {"bandwidth": {"drop_db": rules.GATE["lossy_shelf_drop_db"],
-                        "lossy_suspected": False}}
+    over = _master_facts(bandwidth={"drop_db": rules.GATE["lossy_shelf_drop_db"] + 0.5,
+                                    "lossy_suspected": False})
+    at = _master_facts(bandwidth={"drop_db": rules.GATE["lossy_shelf_drop_db"],
+                                  "lossy_suspected": False})
     assert "lossy_source:measured" in rules.evaluate_gates(over)["reasons"]
     assert "lossy_source:measured" not in rules.evaluate_gates(at)["reasons"]
 
@@ -481,31 +568,33 @@ def test_gain_reduction_budget_uses_peak_gr():
     """The limiter's 4 dB come from the peak, not from -8 vs the -14 playback figure."""
     facts = _master_facts(-8.0, 3.0)
     recipe = rules.build_master_recipe(
-        _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 4.0}), facts, "spotify")
+        _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 10.0}), facts, "spotify")
     assert recipe[0]["action"] == "send_back", recipe
     assert any("gain_reduction_budget" in r for r in recipe[0]["reasons"]), recipe[0]
 
 
 def test_limiter_budget_with_desired_lufs():
-    """A loudness request reaches the peak cap: 4 dB limiter GR + 2.5 dB glue = 6.5."""
+    """A loudness request reaches the peak cap: 4 dB limiter GR + 3 dB glue = 7."""
     facts = _master_facts(-8.0, -0.5)
     recipe = rules.build_master_recipe(
-        _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 4.0}),
+        _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 10.0}),
         facts, "spotify", desired_lufs=-2.0)
     assert recipe[0]["action"] == "send_back", recipe
     assert any("gain_reduction_budget" in r for r in recipe[0]["reasons"]), recipe[0]
 
 
 def test_dither_skipped_when_bits_are_not_reduced():
-    already_16 = {"bit_depth": 16}
+    already_16 = _master_facts(bit_depth=16)
     assert all(a["action"] != "dither"
                for a in rules.build_master_recipe(_answers(), already_16, "cd"))
-    assert rules.build_master_recipe(_answers(), {"bit_depth": 24}, "cd")[-1]["action"] == "dither"
+    assert rules.build_master_recipe(
+        _answers(), _master_facts(bit_depth=24), "cd")[-1]["action"] == "dither"
 
 
 def test_corrective_uses_the_measured_band():
-    facts = {"spectral": {"bands_db_rel": {"sub": -50.0, "bass": 0.0, "low_mid": -45.0,
-                                            "mid": -40.0, "high_mid": -45.0, "high": -50.0}}}
+    facts = _master_facts(spectral={
+        "bands_db_rel": {"sub": -50.0, "bass": 0.0, "low_mid": -45.0,
+                         "mid": -40.0, "high_mid": -45.0, "high": -50.0}})
     recipe = rules.build_master_recipe(_answers(low_end={"score": 3.0}), facts, "spotify")
     bell = next(a for a in recipe if a["action"] == "eq.bell")
     assert bell["freq_hz"] == rules.BAND_CENTERS["bass"], bell
@@ -517,7 +606,7 @@ def test_corrective_uses_the_measured_reference_curve():
               "mid": -40.0, "high_mid": -40.0, "high": -40.0}
     measured = {"sub": -20.0, "bass": -2.0, "low_mid": -13.0,
                 "mid": -10.0, "high_mid": -10.0, "high": -20.0}
-    facts = {"spectral": {"bands_db_rel": master}}
+    facts = _master_facts(spectral={"bands_db_rel": master})
     answers = _answers(low_end={"score": 3.0})
 
     default_bell = next(a for a in rules.build_master_recipe(answers, facts, "spotify")
@@ -546,6 +635,29 @@ def test_mono_compatibility_warning():
                                                                "true_peak_dbtp": -1.2}}
     warnings = rules.loudness_warnings(facts, rules.PLATFORMS["spotify"])
     assert any("mono fold-down" in w for w in warnings), warnings
+
+
+def test_mix_masking_clamp_is_reported_not_hidden():
+    answers = _mix_answers(masking={"score": 10.0})
+    stems = ["01_vocals.wav"]
+    recipe = rules.build_mix_recipe(answers, stems)
+    bell = next(a for a in recipe if a["action"] == "eq.bell")
+    assert bell["gain_db"] == -rules.GATE["max_corrective_db_per_point"], bell
+    warnings = rules.mix_warnings(answers, stems)
+    assert any("capped" in w and "structural" in w for w in warnings), warnings
+
+
+def test_mix_masking_within_cap_is_not_warned():
+    answers = _mix_answers(masking={"score": 3.5})
+    assert not any("capped" in w for w in rules.mix_warnings(answers, ["01_vocals.wav"]))
+
+
+def test_gain_staging_clamp_is_reported_and_unmeasured_is_named():
+    stems = [{"path": "/s/01_vocals.wav", "integrated_lufs": -30.0},
+             {"path": "/s/02_bass.wav"}]
+    warnings = rules.mix_warnings(_mix_answers(), [s["path"] for s in stems], stems)
+    assert any("01_vocals.wav" in w and "capped" in w for w in warnings), warnings
+    assert any("02_bass.wav" in w and "not measured" in w for w in warnings), warnings
 
 
 def test_gain_staging_moves_each_stem_toward_minus_18():

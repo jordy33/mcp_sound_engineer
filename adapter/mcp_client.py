@@ -33,7 +33,7 @@ from .mcp_logic_contract import (
 
 PROTOCOL_VERSION = "2025-03-26"
 CLIENT_NAME = "mcp_sound_engineer"
-CLIENT_VERSION = "0.6.0"
+CLIENT_VERSION = "0.6.1"
 
 DEFAULT_TIMEOUT = 60
 WRITE_TIMEOUT = 120

@@ -32,7 +32,7 @@ A recipe is an ordered array of actions. Order matters: it is the signal chain.
 | `fader` | `target`, `gain_db` (mixing, ≤ ±3), `stem` for a per-stem move |
 | `pan` | `target`, `position` −1..1 |
 | `dither` | `bit_depth` 16 or 24, `type` (`tpdf`) — only for fixed-bit destinations |
-| `send_back` | `reasons` (array of measured causes) — terminal |
+| `send_back` | `reasons` (array of measured causes, or `unmeasured:<field>`) — terminal |
 
 ### Limiter
 
