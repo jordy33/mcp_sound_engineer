@@ -12,11 +12,26 @@ those numbers, which means:
 * it cannot prefer one take over another;
 * it cannot be surprised. If the measurement does not capture a problem, the problem does not exist.
 
-Not implemented yet: denoise, dynamic EQ, tonal shelves. The adapter applies volume, pan, Channel EQ in
-engineering units, compressor ratio/attack/release, the limiter input gain and output ceiling, and
-polarity; de-esser, dither and stereo imaging have no verified surface. It never writes the limiter's
-gain-reduction prediction. Per-section analysis, reference-track deviation and the correlation drop after
-the chain **are** implemented (`analyze_sections`, `analyze_reference`, `judge_master.previous_path`).
+Not decided automatically: denoise, dynamic EQ, tonal shelves (the adapter can apply a hand-written
+`eq.shelf`, but the decision model does not emit one). The adapter applies volume, pan and the
+verified Channel EQ (`Frequency`/`Gain`/`Q` on Low Shelf, Peak 1–4 and High Shelf) in engineering
+units. Limiter, compressor ratio/attack/release, polarity, high-pass, de-esser, dither and stereo
+imaging are **manual**: `mcp_logic` has no verified surface for them, so the adapter emits no call,
+and the always-manual steps are listed in the plan with the reason.
+
+`adapter/loop.py` closes export → measure → compare → iterate, but it only iterates **track** EQ.
+Faders, pan and shelves are applied once (before the stage bounce); master EQ is advisory because
+its band state cannot be read back; the measured effect of a bell is not the transfer function of
+the plug-in, so a correction that does not transfer stops the loop instead of being forced. A
+generated master recipe normally contains `eq.high_pass` and `limiter`, so the loop ends with exit
+`2` (`manual_delivery`/`partial_manual`) rather than claiming delivery.
+
+`export_run` drives the native bounce, but it does not pin dither or bit depth. The loop uses
+`bounce_settings` equality plus sample rate, channel count and duration as evidence that two bounces
+are comparable; that is not a delivery guarantee, and the bounce dialog is never touched.
+
+Per-section analysis, reference-track deviation and the correlation drop after the chain **are**
+implemented (`analyze_sections`, `analyze_reference`, `judge_master.previous_path`).
 
 ## Measurement approximations
 

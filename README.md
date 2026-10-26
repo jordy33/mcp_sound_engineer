@@ -130,7 +130,7 @@ one source of truth for both the numbers and the answer keys.
 | Sibilance | 5–9 kHz relative to full-band energy | `analysis.SIBILANCE_BAND` | measured as `spectral.sibilance_db_rel`; informs the question, not a de-esser threshold |
 | Noise floor | > −50 dB; minor between −60 and −50 | `GATE.noise_floor_moderate_db`, `GATE.noise_floor_minor_db` | **measured in silence only**; > −50 → `send_back`, > −60 → warning; `None` when the file has no gap |
 | Lossy source | cliff > 20 dB between 14–16 k and 16–18 k | `GATE.lossy_shelf_drop_db` | **measured** (suspected flag or measured drop) → `send_back` |
-| `eq.shelf`, `dynamic_eq`, `stereo.width`, `pan` | vocabulary only | `ACTIONS` | ❌ never emitted |
+| `eq.shelf`, `dynamic_eq`, `stereo.width`, `pan` | vocabulary only in the **decision model** | `ACTIONS` | ❌ not emitted by `build_master_recipe`/`build_mix_recipe`; a hand-written `eq.shelf`/`pan` is still applicable by the adapter |
 
 **The decision model never gates.** It scores and chooses treatments; every refusal is measured.
 Asking it "should this be sent back?" produced a global yes/no that contradicted its own
@@ -139,7 +139,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 123 tests: smoke + rules + analysis + adapter
+./start-sound-engineer-mcp.sh --test     # 262 tests: smoke + rules + analysis + adapter + loop
 ```
 
 `tests/test_rules.py` asserts behaviour, plus the limiter's two-constraint arithmetic:
@@ -184,36 +184,79 @@ Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `2.1.0`).
 
 ### Applying it: `adapter/`
 
-The recipe is DAW-neutral; `adapter/` translates it into **verified** `mcp_logic` calls, read from
-its source: `logic_plugins.set_eq_band_verified`, `set_param_verified`, `insert_verified`, and
-`logic_mixer.set_volume/set_pan`.
+The recipe is DAW-neutral; `adapter/` translates it into calls that `mcp_logic` HEAD
+`b42cdd37` verifies (pinned in `adapter/mcp_logic_contract.py`). Anything outside that surface
+is `manual` and emits no call at all. Full contract, loop semantics and safety notes:
+[`docs/ADAPTER.md`](docs/ADAPTER.md).
 
 ```bash
 python -m adapter.cli --recipe recipe.json --project /path/Session.logicx \
-    --tracks "vocal=3:Lead Vocal,01_bass.wav=2:Bass" --master "0:Stereo Out"   # dry run
-# add --apply to post to http://127.0.0.1:8765/mcp
+    --tracks "vocal=3:Lead Vocal,01_bass.wav=2:Bass" --master "Stereo Out" \
+    --inventory /tmp/inventory.json     # dry run against a saved inventory
+# --fetch-inventory reads it live (read-only); --apply always re-reads it live
 ```
 
 A `--tracks` key may be a role or an exported basename. When a recipe action carries `stem`,
 the basename wins over the role key; an explicit `target: "stem"` never falls back to a role.
+The Stereo Out strip has no Arrange index: it is addressed as `strip: "output"`, and an
+`--master` index (`0:Stereo Out`) is accepted only as informational.
 
-| Action | Status | Calls it emits |
+| Action | Status | What it emits |
 |---|---|---|
 | `fader` | **needs_calibration** | `logic_mixer.set_volume` takes a contract 0..1 with a measured taper, **not dB**: run `python -m adapter.calibrate_fader --track N` on a scratch track, then pass `--fader-calibration` |
 | `pan` | **ready** | `logic_mixer.set_pan` |
-| `eq.bell` | **ready** | `set_eq_band_verified` ×3: `Frequency`/`Hz`, `Gain`/`dB`, `Q-Factor`/`Q` |
-| `eq.high_pass`, `eq.high_pass_stem` | **ready** | `set_eq_band_verified` on `Low Cut`, `Frequency`/`Hz` (slope is a host popup → manual) |
-| `eq.shelf` | **ready** | `set_eq_band_verified` on `Low Shelf`/`High Shelf` |
-| `compressor` | **ready** | `insert_verified` + `set_param_verified` for `ratio`, `attack`, `release` |
-| `limiter` | **ready** | `insert_verified` + `set_param_verified` `gain`/`dB` (input) + `outputCeiling`/`dB`; the GR prediction is never written |
-| `polarity.invert` | **ready** | `insert_verified` Gain + `set_param_verified` `phaseInvert` |
-| `de_esser`, `dither`, `stereo.width`, `dynamic_eq` | **unsupported** | not in the verified catalog; the step carries the manual instruction |
+| `eq.bell` | **ready** | `insert_verified` for a new Channel EQ in the first verified-empty slot (track) or `strip: "output"` (master), then `set_eq_band_verified` ×3: `Frequency`/`Hz`, `Gain`/`dB`, `Q`/`Q` |
+| `eq.shelf` | **ready** | same insert, then `Frequency`/`Gain` on `Low Shelf`/`High Shelf` (+ `Q` only when the recipe carries it); the sign is preserved |
+| `eq.high_pass`, `eq.high_pass_stem` | **manual** | Low Cut is observed-only; slope is a host popup |
+| `compressor` | **manual** | insert-only in this surface: no verified ratio/attack/release; inserting DSP you cannot configure is an unverified side effect |
+| `limiter` | **manual** | not in the insert allowlist and no verified-writable parameter |
+| `polarity.invert` | **manual** | Gain is insert-only; `phaseInvert` has no write/readback |
+| `de_esser`, `dither`, `stereo.width`, `dynamic_eq` | **manual** | no verified surface; the step carries the manual instruction |
 | `send_back` | **terminal** | nothing is applied |
 
-Every verified write carries `mode: duplicate_applyback` and `project_expected_path`;
-`insert_verified` also carries `expected_name` (a bare track index is refused by design).
-Compressor `threshold` is normalized 0–100 in that surface — **not dB** — so it is left manual.
-`--apply` is off by default and every call reports applied / error.
+Every plugin call carries `mode: duplicate_applyback` and `project_expected_path`;
+`insert_verified` also carries `expected_name`. Mixer calls are the two-field
+`{"track", "value"}` form. `set_eq_band_verified` never carries `expected_name`, and the adapter
+never emits `Q-Factor`, `outputCeiling` or `phaseInvert`.
+
+`--apply` is off by default. A call is only accepted when the Honest Contract envelope is
+State A (`success`, `verified`, `state: "A"`, and `hc_schema: 2` for `logic_plugins.*`). State B
+(unverified) and State C (error / `write_attempted`) stop the run; there are no write retries
+and no rollback. After an insert the adapter refreshes the live inventory and binds writes to
+the observed `plugin_insert_ref` (track) or the observed slot on `strip: "output"` (master).
+A pre-existing track EQ needs `--overwrite-eq`. A pre-existing master EQ is never reused or
+overwritten: its state is unreadable and the output strip emits no refs.
+
+### Closing the loop: `adapter/loop.py`
+
+`adapter/loop.py` exports a master bounce, measures it, compares it, and iterates **only** on
+verified Channel EQ gains:
+
+```bash
+python -m adapter.loop --recipe recipe.json --project /path/Session.logicx \
+    --tracks "vocal=3:Lead Vocal" --master "Stereo Out" \
+    --output-root /path/exports --apply
+```
+
+It is a dry run without `--apply`: no directories, no exports, no writes, no report. With
+`--apply` it builds `output_root/<run-id>/{baseline,stage,iter-1,iter-2}` (stage only when
+faders/pan/shelves exist), exports with `logic_project.export_plan` + `export_run`, measures
+in-process, and calls `logic_audio.compare_spectra` with `spectral_shape`. Every artifact is
+hashed locally and its `compare_spectra` fingerprint must match, or the loop stops.
+
+The effect window of a bell is the FWHM approximation `|log2(center/freq)| <= 0.72/q`.
+`G_new = G_cur + clamp(deviation, ±--max-correction-db)` and only a track band is corrected,
+read back to ±0.1 dB. Corrections are refused beyond 3 dB per point, 6 dB cumulative, or the
+`--max-cumulative-correction-db` cap. Overlapping bells, manual dynamics, disabled bands and
+master EQ are never auto-corrected. A tracked bell that lands but cannot be measured stops as
+`readback_confirmed`; the loop does not pretend the spectrum confirmed it.
+
+Because the limiter, compressor and high-pass are manual, a generated master recipe normally
+ends with exit `2` (`manual_delivery` or `partial_manual`). The loop can verify EQ transfer; it
+cannot declare final loudness/true-peak delivery. Exit codes: `0` verified convergence,
+static-only, readback-confirmed, terminal recipe or a clean dry run; `2` honest stop with manual
+work, a limit or low trust; `1` failure. The full stop-reason matrix is in
+[`docs/ADAPTER.md`](docs/ADAPTER.md#exit-codes).
 
 ## 7. What has and has not been verified
 
@@ -233,14 +276,17 @@ sensitivity to a known change, not agreement with a trained ear.
 
 ## 8. Status
 
-`0.5.0` (rules 2.1.0). Measurement, gates, sections, references and the recipe contract are in place,
-with CI on 3.9/3.11/3.12. What is still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
+`0.6.0` (rules 2.1.0). Measurement, gates, sections, references, the recipe contract and a
+closed apply → export → measure → iterate loop are in place, with CI on 3.9/3.11/3.12. What is
+still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
 
-* **denoise, dynamic EQ, tonal shelves** — vocabulary without an action;
-* **the adapter covers volume, pan, Channel EQ (Hz/dB/Q), compressor ratio/attack/release, limiter
-  input gain and ceiling, and polarity** — de-esser, dither and stereo imaging have no verified
-  surface;
-* **panning** — vocabulary only; the mix recipe does not emit it yet;
+* **the adapter emits only what mcp_logic verifies** — volume/pan and Channel EQ (a verified-empty
+  insert plus `Frequency`/`Gain`/`Q`). Limiter, compressor, polarity, high-pass, de-esser, dither
+  and stereo imaging are manual;
+* **the loop closes EQ transfer, not loudness delivery** — with a manual limiter/compressor it
+  stops honestly (exit `2`) instead of compensating with EQ;
+* **master Channel EQ is advisory** — its band state cannot be read back, so it is applied once
+  and never auto-corrected;
 * **confidence policy** — answers below a threshold still produce a recipe instead of a refusal;
 * **no human-labelled evaluation** — sensitivity is measured, agreement with an engineer is not.
 

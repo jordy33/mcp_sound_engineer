@@ -45,8 +45,10 @@ input_gain_db                  = min(g_loud, g_max)
 expected_gain_reduction_db     = max(0, true_peak + input_gain_db - ceiling_dbtp)
 ```
 
-* `input_gain_db` is the **control** the adapter writes. `expected_gain_reduction_db` is a
-  **prediction** and must not be written to a plug-in parameter.
+* `input_gain_db` is the **control** a human applies at the limiter. The adapter does not write
+  it: the Limiter has no verified-writable parameter in `mcp_logic`, so the step is planned as
+  `manual`. `expected_gain_reduction_db` is a **prediction** and is never written to a plug-in
+  parameter.
 * `desired_lufs` is optional and is **not** a delivery target. Without it the limiter is
   peak-only, which is the recommended mode for streaming (playback normalization already turns
   a hotter master down).
@@ -61,12 +63,23 @@ expected_gain_reduction_db     = max(0, true_peak + input_gain_db - ceiling_dbtp
 
 ## Adapter obligations
 
-1. Reject unknown actions and out-of-range parameters loudly (`validate_recipe` already does).
-2. Apply in order. Planning statuses are `ready`, `needs_calibration`, `unresolved`,
-   `unsupported` and `terminal`; execution results are `applied` or `error`.
-3. Support `dry_run` (plan only, no change).
+1. Validate loudly before emitting anything: `rules.validate_recipe` for actions and ranges, and
+   the recipe's `schema` must equal the `RECIPE_SCHEMA_VERSION` the adapter implements. A bad
+   recipe produces an actionable error, never a partial plan.
+2. Apply in order. Planning statuses are `ready`, `manual`, `needs_calibration`, `needs_inventory`,
+   `unresolved` and `terminal`; execution results are `applied`, `error`, `skipped` and `partial`.
+3. Support `dry_run` (plan only, no change). The adapter CLI and loop write nothing unless
+   `--apply` is given.
 4. Never invent parameters that the recipe did not carry.
-5. Write `input_gain_db` as the limiter input gain; never write the GR prediction.
+5. Only emit what `mcp_logic` verifies: mixer volume, pan, and Channel EQ
+   `Frequency`/`Gain`/`Q`. A write is `applied` only in Honest Contract State A
+   (`success`, `verified`, `state: "A"`, and `hc_schema: 2` for `logic_plugins.*`). State B/C
+   stops the run; there is no retry and no rollback.
+6. `limiter`, `compressor`, `polarity.invert`, `eq.high_pass`, `de_esser`, `dither`,
+   `stereo.width` and `dynamic_eq` are `manual` and emit no call. The limiter's
+   `input_gain_db`, `ceiling_dbtp` and GR prediction stay instructions for a human.
+7. `send_back` is terminal: nothing is applied and the reasons are surfaced.
+8. Missing live inventory is `needs_inventory`; the adapter never assumes an empty slot 0.
 
 ## Migration 2.0.0 → 2.1.0
 

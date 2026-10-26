@@ -19,7 +19,7 @@ except ImportError:  # executed as a script: python server/engineer_server.py
     from jev import ask, config
 
 SERVER_NAME = "mcp_sound_engineer"
-SERVER_VERSION = "0.5.0"
+SERVER_VERSION = "0.6.0"
 
 # Jev schemas live in rules.py: one source of truth for the answer keys.
 MASTER_QUESTIONS = rules.MASTER_QUESTIONS
