@@ -1,0 +1,115 @@
+{
+  "contract_version": "mcp_logic@b42cdd37+2026-10-26",
+  "mcp_logic_commit": "b42cdd37",
+  "captured_at": "2026-10-26",
+  "master_selector": {"strip": "output"},
+  "master_expected_name": "Stereo Out",
+  "mode": "duplicate_applyback",
+  "hc_v2_schema": 2,
+  "eq_verified_bands": [
+    "Low Shelf", "Peak 1", "Peak 2", "Peak 3", "Peak 4", "High Shelf"
+  ],
+  "eq_observed_only_bands": ["Low Cut", "High Cut"],
+  "bell_bands": ["Peak 1", "Peak 2", "Peak 3", "Peak 4"],
+  "shelf_bands": ["Low Shelf", "High Shelf"],
+  "eq_parameter": {
+    "freq": ["Frequency", "Hz"],
+    "gain": ["Gain", "dB"],
+    "q": ["Q", "Q"]
+  },
+  "channel_eq_plugin_id": "logic.stock.effect.channel_eq",
+  "insertable_plugins": ["Channel EQ", "Compressor", "Gain"],
+  "insertable_plugin_ids": [
+    "logic.stock.effect.channel_eq",
+    "logic.stock.effect.compressor",
+    "logic.stock.effect.gain"
+  ],
+  "compressor_verified_params": ["auto_release", "limiter_on", "threshold"],
+  "manual_actions": [
+    "compressor",
+    "de_esser",
+    "dither",
+    "dynamic_eq",
+    "eq.high_pass",
+    "eq.high_pass_stem",
+    "limiter",
+    "polarity.invert",
+    "stereo.width"
+  ],
+  "terminal_actions": ["send_back"],
+  "forbidden_emissions": [
+    "Q-Factor", "outputCeiling", "phaseInvert", "ratio", "attack", "release"
+  ],
+  "provenance": [
+    {
+      "claim": "Channel EQ exposes Frequency/Gain/Q on six named non-cut bands; Q is literally \"Q\"; 18 of 24 parameters have a measured round trip",
+      "file": "Sources/LogicProMCP/Plugins/ChannelEQBandCatalog.swift",
+      "lines": "50-62, 94-103, 133-174"
+    },
+    {
+      "claim": "Channel EQ catalog: 18 of 24 named parameters carry a reciprocal write/readback; Low Cut/High Cut do not",
+      "file": "Sources/LogicProMCP/Plugins/StockPluginCatalog.swift",
+      "lines": "1487-1494"
+    },
+    {
+      "claim": "Compressor verified parameters are threshold, limiter_on and auto_release",
+      "file": "Sources/LogicProMCP/Plugins/VerifiedPluginCatalog.swift",
+      "lines": "60-73"
+    },
+    {
+      "claim": "insert_verified's real allowlist is Gain, Channel EQ and Compressor; Limiter is not insertable",
+      "file": "Sources/LogicProMCP/Channels/AccessibilityChannel+VerifiedPlugins.swift",
+      "lines": "5597-5605, 7403-7407"
+    },
+    {
+      "claim": "Inventory read_status is one of empty/ok/unreadable/unclassified",
+      "file": "Sources/LogicProMCP/Accessibility/AXLogicProElements+PluginSlots.swift",
+      "lines": "37-40"
+    },
+    {
+      "claim": "plugin_insert_ref is added to track inventory only, under State A with complete=true",
+      "file": "Sources/LogicProMCP/Dispatchers/PluginsDispatcher+TargetReferences.swift",
+      "lines": "6-81"
+    },
+    {
+      "claim": "logic_plugins.* uses Honest Contract v2 with hc_schema 2",
+      "file": "Sources/LogicProMCP/Utilities/HonestContract.swift",
+      "lines": "397-435"
+    },
+    {
+      "claim": "Master Stereo Output is addressed with strip:\"output\"; plugin-ref reads reject strip",
+      "file": "Sources/LogicProMCP/Dispatchers/PluginsDispatcher.swift",
+      "lines": "87"
+    },
+    {
+      "claim": "export_plan/export_run are logic_project command tools; export_run requires confirmed",
+      "file": "Sources/LogicProMCP/Dispatchers/ProjectDispatcher.swift",
+      "lines": "25, 114-140"
+    },
+    {
+      "claim": "compare_spectra accepts comparison_mode absolute|spectral_shape and optional output_root",
+      "file": "Sources/LogicProMCP/Dispatchers/AudioDispatcher.swift",
+      "lines": "15, 52, 170-212"
+    },
+    {
+      "claim": "spectral_shape residualDb subtracts the median shared uncensored band delta; completeness and fingerprints are enforced",
+      "file": "Sources/LogicProMCP/SpectralEQ/SpectralComparison.swift",
+      "lines": "53-78, 97-147"
+    },
+    {
+      "claim": "export plan status is planned|degraded; collision_policy is fail_if_exists|skip_existing; cloud_delivery is always surfaced",
+      "file": "Sources/LogicProMCP/Projects/ProjectExportPlanner.swift",
+      "lines": "16-19, 54-60"
+    },
+    {
+      "claim": "cloud_delivery is always listed in unsupported_or_blocked_steps for a bounce",
+      "file": "Sources/LogicProMCP/Projects/ProjectExportPlannerSupport.swift",
+      "lines": "129-145"
+    },
+    {
+      "claim": "export_run response schema and counters; bounce settings and evidence fields",
+      "file": "Sources/LogicProMCP/Projects/ProjectExportExecutorModels.swift",
+      "lines": "3-36, 59-108, 150-160"
+    }
+  ]
+}
