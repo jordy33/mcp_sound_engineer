@@ -75,7 +75,8 @@ def test_mcp_handshake():
     listing = send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
     names = {t["name"] for t in listing["result"]["tools"]}
     assert names == {"analyze_master", "analyze_stems", "analyze_sections", "analyze_reference",
-                     "judge_master", "judge_mix", "validate_recipe", "engineer_info"}
+                     "judge_master", "judge_mix", "validate_recipe", "verify_recipe",
+                     "engineer_info"}
     info = send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                  "params": {"name": "engineer_info", "arguments": {}}})
     assert info["result"]["isError"] is False
@@ -114,8 +115,119 @@ def test_tools_call_arguments_must_be_an_object():
 
 def test_handle_rejects_non_object_and_bad_params():
     assert engineer_server.handle([1, 2, 3])["error"]["code"] == -32600
-    assert engineer_server.handle({"method": "tools/call",
+    assert engineer_server.handle({"jsonrpc": "2.0", "id": 1, "method": "tools/call",
                                    "params": []})["error"]["code"] == -32602
+
+
+def test_notifications_are_never_answered():
+    """JSON-RPC forbids replying to a notification, including with an error."""
+    for method in ("notifications/initialized", "notifications/cancelled",
+                   "notifications/progress", "notifications/roots/list_changed",
+                   "custom/notification"):
+        assert engineer_server.handle(
+            {"jsonrpc": "2.0", "method": method, "params": {}}) is None, method
+    # A mistakenly supplied id does not make an MCP notification answerable.
+    assert engineer_server.handle({"jsonrpc": "2.0", "id": 9,
+                                   "method": "notifications/cancelled",
+                                   "params": {}}) is None
+
+
+def test_notification_does_not_shift_the_next_response():
+    proc = _start_server()
+    try:
+        proc.stdin.write(json.dumps({"jsonrpc": "2.0",
+                                     "method": "notifications/cancelled",
+                                     "params": {}}) + "\n")
+        proc.stdin.flush()
+        reply = _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+        assert reply == {"jsonrpc": "2.0", "id": 1, "result": {}}, reply
+        assert proc.poll() is None
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
+def test_missing_tool_argument_is_a_tool_error_not_a_crash():
+    """A KeyError inside a handler must not kill the stdio loop."""
+    proc = _start_server()
+    try:
+        reply = _send(proc, {"jsonrpc": "2.0", "id": 1, "method": "tools/call",
+                             "params": {"name": "analyze_master", "arguments": {}}})
+        assert reply["result"]["isError"] is True, reply
+        assert "path" in reply["result"]["content"][0]["text"], reply
+        ping = _send(proc, {"jsonrpc": "2.0", "id": 2, "method": "ping", "params": {}})
+        assert ping["result"] == {}, ping
+        assert proc.poll() is None
+    finally:
+        proc.stdin.close()
+        proc.wait(timeout=5)
+
+
+def test_verify_recipe_checks_measurements_after_the_bounce():
+    with tempfile.TemporaryDirectory() as tmp:
+        before = os.path.join(tmp, "before.wav")
+        after = os.path.join(tmp, "after.wav")
+        make_wav(before)
+        make_wav(after)
+        recipe = [
+            {"id": "mid", "action": "eq.bell", "target": "master",
+             "schema": engineer_server.rules.RECIPE_SCHEMA_VERSION,
+             "freq_hz": 1250, "gain_db": -2.0, "q": 4.0, "role": "corrective",
+             "expect": {"metric": "spectral.bands_db_rel.mid", "delta_db": 0.0,
+                        "tolerance_db": 1.0}},
+            {"id": "missing", "action": "eq.bell", "target": "master",
+             "schema": engineer_server.rules.RECIPE_SCHEMA_VERSION,
+             "freq_hz": 4000, "gain_db": -1.0, "q": 4.0, "role": "corrective",
+             "expect": {"metric": "spectral.not_measured", "delta_db": 0.0,
+                        "tolerance_db": 1.0}},
+        ]
+        result = engineer_server.tool_verify_recipe(recipe, before, after)
+    checks = {c["id"]: c for c in result["checks"]}
+    assert result["valid"] is True, result
+    assert checks["mid"]["status"] == "met", checks["mid"]
+    assert checks["missing"]["status"] == "unmeasured", checks["missing"]
+    assert result["met"] == 1 and result["unmeasured"] == 1, result
+    assert result["all_met"] is False, result
+
+
+def test_judge_master_names_the_generic_reference_fallback():
+    facts = {
+        "file": "/tmp/master.wav", "sample_rate": 44100, "channels": 2,
+        "duration_seconds": 60.0, "bit_depth": 24,
+        "loudness": {"integrated_lufs": -18.0, "true_peak_dbtp": -3.0,
+                     "loudness_range_lu": 9.0, "sample_peak_dbfs": -3.0,
+                     "crest_db": 10.0},
+        "spectral": {"bands_db_rel": {"sub": -20.0, "bass": -10.0, "low_mid": -12.0,
+                                      "mid": -8.0, "high_mid": -13.0, "high": -17.0},
+                     "sibilance_db_rel": -20.0},
+        "stereo": {"phase_correlation": 0.9, "mono_cancel_db": -30.0},
+        "clipping": {"count": 0, "samples": 0, "proportion": 0.0},
+        "noise": {"floor_dbfs": None},
+        "bandwidth": {"lossy_suspected": False, "drop_db": 0.0, "cutoff_hz": 20000},
+    }
+    captured = {}
+    original_analyze = engineer_server.analyze_master
+    original_ask = engineer_server.ask
+
+    def fake_analyze(path):
+        return dict(facts)
+
+    def fake_ask(state, questions):
+        captured.update(state)
+        return _master_answers()
+
+    engineer_server.analyze_master = fake_analyze
+    engineer_server.ask = fake_ask
+    try:
+        result = engineer_server.tool_judge_master("/tmp/master.wav")
+    finally:
+        engineer_server.analyze_master = original_analyze
+        engineer_server.ask = original_ask
+
+    assert result["reference_source"] == "generic_default", result
+    assert captured["reference_source"] == "generic_default", captured
+    assert "reference_note" in captured, captured
+    assert any("generic fallback" in w for w in result["warnings"]), result["warnings"]
 
 
 def test_judge_master_passes_measured_reference_and_intent():

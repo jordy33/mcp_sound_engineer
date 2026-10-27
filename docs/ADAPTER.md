@@ -7,7 +7,7 @@ the adapter does not emit it**.
 * Contract: `adapter/mcp_logic_contract.py`
 * Pinned commit: `b42cdd37` (`2026-10-26`)
 * `ADAPTER_CONTRACT_VERSION = "mcp_logic@b42cdd37+2026-10-26"`
-* Recipe schema: `2.1.0` (unchanged)
+* Recipe schema: `2.2.0` (`id` and `expect` are carried through; the action vocabulary is unchanged)
 
 `tests/fixtures/mcp_logic_contract.json` records the provenance (`commit`, date, source file and
 line) for every name below. The tests assert that generated calls use only vocabulary from that
@@ -81,7 +81,8 @@ inventory refresh after an insert (short polling, read-only) is allowed to find 
 write itself is never retried.
 
 `apply_steps` records per call: step, call, operation, `hc_schema`, `state`, `verified`, `reason`,
-`error`, `write_attempted` and the full payload.
+`error`, `write_attempted` and the full payload. Each plan step also carries the recipe action's
+`id` and, when present, its `expect`; those are report metadata, never calls.
 
 ## Planning states
 

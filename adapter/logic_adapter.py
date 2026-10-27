@@ -680,6 +680,10 @@ def _build_step(index, action, resolution, prepared, project_path,
             "none" if capability == "terminal" else "adapter"),
     }
     _attach_target(step, target)
+    if action.get("id"):
+        step["id"] = action["id"]
+    if action.get("expect") is not None:
+        step["expect"] = action["expect"]
 
     if capability is None:
         step.update(status="unresolved", reason="unknown_action",

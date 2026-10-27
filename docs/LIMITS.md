@@ -41,11 +41,14 @@ implemented (`analyze_sections`, `analyze_reference`, `judge_master.previous_pat
 | `true_peak_dbtp` | 4× polyphase FIR over the whole file, edges included (BS.1770 minimum). Dedicated meters use 8× — expect ±0.3 dB on normal material, more near Nyquist |
 | `loudness_range_lu` | EBU R128 / Tech 3342: K-weighted 3 s short-term loudness, −70 LUFS absolute gate, −20 LU relative gate, P95−P10. `null` when the file is shorter than 3 s |
 | `phase_correlation` | one number for the whole file; it does not localize |
-| `band_overlap_pairs` | average per-band minimum of relative band energy: a spectral-crowding proxy, not perceptual masking |
+| `band_overlap_pairs` | average per-band minimum of relative band energy: a spectral-crowding proxy, not perceptual masking; `dominant_band` names the largest shared band |
+| masking bell | the cut frequency comes from the measured dominant shared band; sub/bass-only overlap emits no bus bell, and no measurement means no frequency is invented |
 | noise floor | measurable **only inside a real gap**; returns `None` on continuous music |
 | lossy detection | a cliff test at 16 kHz; a 22 kHz cut on a 44.1 kHz file still looks "full band" |
 | stem gates | need named stems (`vocals`, `drums`, `bass`); an unnamed export cannot be role-matched |
-| reference curve | measured from the file when `reference_path` is given; a normalized **constant** otherwise |
+| reference curve | measured from the file when `reference_path` is given; a generic normalized **constant** otherwise, reported as `reference_source: "generic_default"` and warned about (a bass-heavy genre can read as low-end excess). The default is normalized over the six bands; `bands_db_rel` is relative to the full spectrum, so its six-band sum can be slightly below 0 when energy exists below 20 Hz or above 16 kHz. Renormalizing only shifts a curve by a constant, which cancels when the worst band is chosen |
+| upward expansion | not offered: it has no verified mapping, and an over-compressed master is an upstream problem; the recipe leaves dynamics unchanged and says so |
+| post-bounce expectations | `verify_recipe` can only check the metrics that exist (`bands_db_rel`, true peak, stem LUFS, …). Compressor ratio, polarity, dither and stereo width carry no `expect`, and a missing metric is `unmeasured`, never `met` |
 | sibilance | 5–9 kHz energy relative to full-band; a descriptor, **not** a de-esser threshold |
 | limiter gain reduction | a **prediction** from measured LUFS/true peak, not a measurement of the limited file; it assumes the peak lands on the ceiling, and the real GR depends on the material |
 | pre-limiter trim | up to 3 dB of input trim; beyond 4 dB GR + 3 dB trim (7 dB over the ceiling) the recipe is a terminal `send_back`, not a request to limit harder |

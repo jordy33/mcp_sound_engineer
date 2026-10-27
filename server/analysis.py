@@ -491,10 +491,16 @@ def analyze_stems(paths: list[str]) -> dict:
     for i in range(len(stems)):
         for j in range(i + 1, len(stems)):
             a, b = stems[i], stems[j]
-            overlap = sum(min(a["bands_db_rel"][k], b["bands_db_rel"][k])
-                          for k in BANDS) / len(BANDS)
+            shared = {k: min(a["bands_db_rel"][k], b["bands_db_rel"][k]) for k in BANDS}
+            overlap = sum(shared.values()) / len(BANDS)
+            # The mean is the crowding score; the dominant band is where a bell
+            # can act. Both are relative energies, so the larger (less negative)
+            # shared band is the one both stems occupy.
+            dominant = max(shared, key=shared.get)
             overlap_pairs.append({"a": a["name"], "b": b["name"],
-                                  "band_overlap_db": round(overlap, 2)})
+                                  "band_overlap_db": round(overlap, 2),
+                                  "dominant_band": dominant,
+                                  "dominant_band_overlap_db": round(shared[dominant], 2)})
     overlap_pairs.sort(key=lambda m: -m["band_overlap_db"])
     return plain({"stems": stems,
                   "band_overlap_pairs": overlap_pairs[:5],

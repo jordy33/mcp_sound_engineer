@@ -15,8 +15,8 @@ import math
 import os
 import re
 
-RULES_VERSION = "2.1.2"
-RECIPE_SCHEMA_VERSION = "2.1.0"
+RULES_VERSION = "2.2.0"
+RECIPE_SCHEMA_VERSION = "2.2.0"
 
 # --- Gates: when to refuse to master a mix -----------------------------------
 GATE = {
@@ -77,9 +77,13 @@ PLATFORMS = {
     "podcast":     {"normalization_lufs": -16.0, "true_peak_ceiling": -1.0, "bit_depth": 16, "dither": "tpdf"},
 }
 
-# --- Reference curve (dB relative to total energy) ---------------------------
-# Normalized so the linear powers sum to 1.0 (0 dB total). Used only when no
-# measured reference was supplied.
+# --- Reference curve (dB relative to the six measured bands) ------------------
+# A generic fallback, NOT a genre target: it is used only when no measured
+# reference was supplied. Normalized so the six linear powers sum to 1.0 (0 dB).
+# `analysis.bands_db_rel` normalizes each band against the full-spectrum total,
+# so its six-band sum is slightly below 0 when energy exists below 20 Hz or above
+# 16 kHz. Renormalizing either curve shifts all of its bands by one constant,
+# which cancels when the largest excess is chosen; it is documented in LIMITS.md.
 _RAW_CURVE = {"sub": -18.0, "bass": -11.0, "low_mid": -12.0,
               "mid": -8.0, "high_mid": -13.0, "high": -17.0}
 _TOTAL = sum(10 ** (v / 10) for v in _RAW_CURVE.values())
@@ -120,10 +124,10 @@ MASTER_QUESTIONS = {
                                "deess": "dynamic de-esser",
                                "cut": "narrow static cut around 7 kHz"}},
     "dynamics": {"type": "choice",
-                 "instructions": "Dynamics work needed? LRA < 4 LU or crest < 6 dB means already compressed.",
+                 "instructions": "Dynamics work needed? LRA < 4 LU or crest < 6 dB means already compressed; "
+                                 "upward expansion is not offered because it has no verified mapping.",
                  "criteria": {"none": "already dense, do not compress",
-                              "glue": "gentle bus glue, 1-3 dB GR",
-                              "expand": "upward expansion to restore range"}},
+                              "glue": "gentle bus glue, 1-3 dB GR"}},
     "dynamics_amount": {"type": "score",
                         "instructions": "If bus glue is used, how much gain reduction? 1-3 dB is the range.",
                         "criteria": ["0-1 dB", "1-1.5 dB", "1.5-2 dB", "2-2.5 dB", "2.5-3 dB"]},
@@ -166,6 +170,10 @@ SCORE_MAX = 10.0
 # the requested cut grows 1:1 with the score, capped by GATE.
 MASKING_SCORE_BASE = 2.0
 MASKING_SCORE_THRESHOLD = 2.5
+# Only a shared mid/high band can be treated with a bus bell. A pair whose only
+# overlap is sub/bass needs faders or a high-pass, not a 300 Hz bus cut.
+MASKING_BANDS = ("low_mid", "mid", "high_mid", "high")
+MASKING_MIN_BAND_DB = -15.0
 
 
 def clamp(value: float, lo: float, hi: float) -> float:
@@ -235,6 +243,106 @@ def _action(action: str, target: str = "master", **params) -> dict:
     if target not in TARGETS:
         raise ValueError(f"unknown target: {target}")
     return {"action": action, "target": target, "schema": RECIPE_SCHEMA_VERSION, **params}
+
+
+def _slug(text) -> str:
+    return re.sub(r"[^a-z0-9]+", "-", str(text).lower()).strip("-") or "x"
+
+
+def _finalize(recipe: list[dict]) -> list[dict]:
+    """Give every action a stable, human-readable id.
+
+    The id is derived from what the action does, not its array index, so a
+    report after a bounce still points at the same action even if the recipe is
+    regenerated with one more move. Duplicates get a numeric suffix.
+    """
+    seen: dict[str, int] = {}
+    for item in recipe:
+        if not isinstance(item, dict) or item.get("id"):
+            continue
+        parts = [item.get("action", "action"), item.get("target", "target")]
+        if item.get("stem"):
+            parts.append(os.path.splitext(os.path.basename(str(item["stem"])))[0])
+        elif item.get("band"):
+            parts.append(str(item["band"]))
+        elif item.get("freq_hz") is not None:
+            parts.append(f"{float(item['freq_hz']):g}hz")
+        base = ":".join(_slug(p) for p in parts)
+        seen[base] = seen.get(base, 0) + 1
+        item["id"] = base if seen[base] == 1 else f"{base}:{seen[base]}"
+    return recipe
+
+
+# Public alias: the MCP server finalizes the measured send_back recipe too.
+finalize_recipe = _finalize
+
+
+def _expect_delta(metric: str, delta_db: float, tolerance_db: float,
+                  stem: str | None = None) -> dict:
+    expect = {"metric": metric, "delta_db": _round_db(delta_db),
+              "tolerance_db": float(tolerance_db)}
+    if stem:
+        expect["stem"] = stem
+    return expect
+
+
+def _expect_max(metric: str, maximum: float, tolerance_db: float = 0.1) -> dict:
+    return {"metric": metric, "max": _round_db(maximum),
+            "tolerance_db": float(tolerance_db)}
+
+
+def _stem_name(stem: dict) -> str:
+    return str(stem.get("name") or os.path.splitext(
+        os.path.basename(str(stem.get("path", ""))))[0])
+
+
+def _band_overlap_plan(stem_facts: list[dict] | None) -> dict:
+    """Pick the pair and frequency a masking bell should act on.
+
+    The score says *how much* masking, but only the measured stems say *where*.
+    Low-band overlap is deliberately excluded: a bus bell at 150 Hz would take
+    weight out of the whole mix, while the actual fix is a fader or high-pass.
+    """
+    measured = False
+    best = None
+    facts = [s for s in stem_facts or [] if isinstance(s, dict)]
+    for i in range(len(facts)):
+        for j in range(i + 1, len(facts)):
+            a, b = facts[i], facts[j]
+            bands_a, bands_b = a.get("bands_db_rel"), b.get("bands_db_rel")
+            if not isinstance(bands_a, dict) or not isinstance(bands_b, dict):
+                continue
+            values = {}
+            for band in BAND_CENTERS:
+                value_a, value_b = _number(bands_a.get(band)), _number(bands_b.get(band))
+                if value_a is not None and value_b is not None:
+                    values[band] = min(value_a, value_b)
+            if not values:
+                continue
+            measured = True
+            band = max(MASKING_BANDS, key=lambda k: values.get(k, -999.0))
+            if values.get(band, -999.0) < MASKING_MIN_BAND_DB:
+                continue
+            if best is None or values[band] > best["overlap_db"]:
+                best = {"status": "measured", "band": band,
+                        "freq_hz": BAND_CENTERS[band],
+                        "stems": [_stem_name(a), _stem_name(b)],
+                        "overlap_db": round(values[band], 1)}
+    if best is not None:
+        return best
+    return {"status": "low_band_only" if measured else "unmeasured",
+            "band": None, "freq_hz": None, "stems": [], "overlap_db": None}
+
+
+def _masking_plan(answers: dict, stem_facts: list[dict] | None) -> dict | None:
+    score = _score(answers, "masking")
+    if score < MASKING_SCORE_THRESHOLD:
+        return None
+    plan = _band_overlap_plan(stem_facts)
+    plan["score"] = score
+    plan["cut_db"] = _round_db(clamp(score - MASKING_SCORE_BASE, 0.0,
+                                     GATE["max_corrective_db_per_point"]))
+    return plan
 
 
 # --------------------------------------------------------------------------
@@ -417,6 +525,16 @@ def limiter_warnings(recipe: list) -> list[str]:
     return out
 
 
+def master_warnings(answers: dict) -> list[str]:
+    """Name decisions the recipe deliberately does not turn into an action."""
+    out: list[str] = []
+    if _choice(answers, "dynamics") == "expand":
+        out.append("upward expansion was requested but is not emitted: it has no verified "
+                   "mapping, and over-compressed material is an upstream problem. Dynamics "
+                   "are unchanged; fix the mix or leave it alone.")
+    return out
+
+
 def _limiter_plan(facts: dict, target: dict, desired_lufs: float | None) -> dict:
     loud = facts.get("loudness") or {}
     lufs, tp = loud.get("integrated_lufs"), loud.get("true_peak_dbtp")
@@ -442,15 +560,15 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
 
     gates = evaluate_gates(facts)
     if gates["send_back"]:
-        return [_action("send_back", reasons=gates["reasons"])]
+        return _finalize([_action("send_back", reasons=gates["reasons"])])
 
     limiter_plan = _limiter_plan(facts, target, desired_lufs)
     ceiling = target["true_peak_ceiling"]
     tp = (facts.get("loudness") or {}).get("true_peak_dbtp")
     if tp is not None and (float(tp) - ceiling) > (GATE["max_limiter_gr_db"]
                                                     + GATE["max_limiter_input_trim_db"]):
-        return [_action("send_back",
-                        reasons=[f"peak_beyond_limiter:{float(tp)}dBTP:{ceiling}dBTP"])]
+        return _finalize([_action("send_back",
+                                  reasons=[f"peak_beyond_limiter:{float(tp)}dBTP:{ceiling}dBTP"])])
 
     recipe: list[dict] = [_action("eq.high_pass", freq_hz=25, slope_db_oct=12, reason="sub-bass cleanup")]
 
@@ -466,14 +584,16 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
         freq = BAND_CENTERS[worst]
         needed = (level - 2.0) * 2.0   # level 4 (extreme) demands 4 dB -> send back
         if needed > GATE["max_corrective_db_per_point"]:
-            return [_action("send_back",
-                            reasons=[f"corrective_beyond_cap:{band}:{round(needed, 1)}dB"])]
+            return _finalize([_action("send_back",
+                                      reasons=[f"corrective_beyond_cap:{band}:{round(needed, 1)}dB"])])
         total += needed
         if total > GATE["max_cumulative_corrective_db"]:
-            return [_action("send_back",
-                            reasons=[f"corrective_beyond_cap:cumulative:{round(total, 1)}dB"])]
+            return _finalize([_action("send_back",
+                                      reasons=[f"corrective_beyond_cap:cumulative:{round(total, 1)}dB"])])
         recipe.append(_action("eq.bell", freq_hz=freq, gain_db=-round(needed, 1), q=4.0,
-                              role="corrective", measured_from=band, band=worst))
+                              role="corrective", measured_from=band, band=worst,
+                              expect=_expect_delta(f"spectral.bands_db_rel.{worst}",
+                                                   -round(needed, 1), 1.5)))
 
     # Dynamics before sibilance: the de-esser belongs to the dynamic stage, after compression.
     if _choice(answers, "dynamics") == "glue":
@@ -482,15 +602,14 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
                        GATE["min_gain_reduction_db"], GATE["max_gain_reduction_db"])
         recipe.append(_action("compressor", target="master", ratio=2.0, attack_ms=20,
                               release_ms=200, gain_reduction_db=round(gr, 1)))
-    elif _choice(answers, "dynamics") == "expand":
-        recipe.append(_action("compressor", target="master", mode="upward_expand",
-                              reason="restore range on over-compressed material"))
+    # `expand` is deliberately not emitted: it has no verified mapping and an
+    # already over-compressed master is an upstream problem, not an EQ-shaped one.
 
     total_gr = sum(a.get("gain_reduction_db", 0.0) for a in recipe if a["action"] == "compressor")
     total_gr += limiter_plan["expected_gain_reduction_db"]
     if total_gr > GATE["max_total_gain_reduction_db"]:
-        return [_action("send_back",
-                        reasons=[f"gain_reduction_budget:{round(total_gr, 1)}dB"])]
+        return _finalize([_action("send_back",
+                                  reasons=[f"gain_reduction_budget:{round(total_gr, 1)}dB"])])
 
     sib = _choice(answers, "sibilance")
     if sib == "deess":
@@ -499,9 +618,10 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
         needed = 1.5
         total += needed
         if total > GATE["max_cumulative_corrective_db"]:
-            return [_action("send_back",
-                            reasons=[f"corrective_beyond_cap:cumulative:{round(total, 1)}dB"])]
-        recipe.append(_action("eq.bell", freq_hz=7000, gain_db=-needed, q=6.0, role="corrective"))
+            return _finalize([_action("send_back",
+                                      reasons=[f"corrective_beyond_cap:cumulative:{round(total, 1)}dB"])])
+        recipe.append(_action("eq.bell", freq_hz=7000, gain_db=-needed, q=6.0, role="corrective",
+                              expect=_expect_delta("spectral.sibilance_db_rel", -needed, 1.5)))
 
     limiter_params = {
         "ceiling_dbtp": ceiling,
@@ -513,6 +633,7 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
     }
     if desired_lufs is not None:
         limiter_params["desired_lufs"] = desired_lufs
+    limiter_params["expect"] = _expect_max("loudness.true_peak_dbtp", ceiling)
     recipe.append(_action("limiter", **limiter_params))
 
     # Dither belongs to the destination, and only when bits are actually reduced.
@@ -520,7 +641,7 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
     reducing = source_bits is None or target["bit_depth"] < int(source_bits)
     if target["dither"] != "none" and reducing:
         recipe.append(_action("dither", bit_depth=target["bit_depth"], type=target["dither"]))
-    return recipe
+    return _finalize(recipe)
 
 
 def correlation_drop(before: dict, after: dict, limit: float = 0.15) -> dict:
@@ -542,6 +663,99 @@ def correlation_drop(before: dict, after: dict, limit: float = 0.15) -> dict:
     drop = round(b - a, 3)
     return {"before": b, "after": a, "drop": drop, "exceeds": drop > limit,
             "unmeasured": []}
+
+
+def _metric_value(facts, metric: str, stem_facts: dict | None, stem_key: str | None):
+    """Resolve `spectral.bands_db_rel.mid` or `stem.integrated_lufs` to a number."""
+    if not isinstance(facts, dict) or not isinstance(metric, str):
+        return None
+    if metric.startswith("stem."):
+        if not isinstance(stem_facts, dict) or not isinstance(stem_key, str):
+            return None
+        key = os.path.splitext(os.path.basename(stem_key))[0]
+        facts = stem_facts.get(key)
+        if not isinstance(facts, dict):
+            return None
+        metric = metric[5:]
+    value = facts
+    for part in metric.split("."):
+        if not isinstance(value, dict):
+            return None
+        value = value.get(part)
+    return _number(value)
+
+
+def verify_expectations(recipe: list, before: dict, after: dict,
+                        stems_before: dict | None = None,
+                        stems_after: dict | None = None) -> list[dict]:
+    """Check each action's measurable `expect` after a bounce.
+
+    A missing metric is `unmeasured`, never `met`: the loop must not claim an
+    effect it did not measure. The result is keyed by the action's `id`.
+    """
+    checks: list[dict] = []
+    for index, action in enumerate(recipe or []):
+        if not isinstance(action, dict) or not isinstance(action.get("expect"), dict):
+            continue
+        expect = action["expect"]
+        metric = expect.get("metric")
+        stem_key = expect.get("stem")
+        before_value = _metric_value(before, metric, stems_before, stem_key)
+        after_value = _metric_value(after, metric, stems_after, stem_key)
+        check = {
+            "id": action.get("id") or f"action[{index}]",
+            "action": action.get("action"),
+            "metric": metric,
+            "expect": dict(expect),
+            "before": before_value,
+            "after": after_value,
+            "status": "unmeasured",
+        }
+        if before_value is None or after_value is None:
+            check["reason"] = "metric not measured on both sides"
+        elif "delta_db" in expect:
+            delta = round(after_value - before_value, 2)
+            tolerance = _number(expect.get("tolerance_db")) or 0.0
+            check["measured_delta_db"] = delta
+            check["status"] = ("met" if abs(delta - float(expect["delta_db"]))
+                               <= tolerance else "missed")
+        elif "max" in expect:
+            tolerance = _number(expect.get("tolerance_db")) or 0.0
+            check["status"] = ("met" if after_value <= float(expect["max"]) + tolerance
+                               else "missed")
+        elif "min" in expect:
+            tolerance = _number(expect.get("tolerance_db")) or 0.0
+            check["status"] = ("met" if after_value >= float(expect["min"]) - tolerance
+                               else "missed")
+        else:
+            check["reason"] = "expectation has no delta_db, max or min"
+        checks.append(check)
+    return checks
+
+
+def _expect_violations(action: dict, index: int) -> list[dict]:
+    expect = action.get("expect")
+    if expect is None:
+        return []
+    if not isinstance(expect, dict):
+        return [{"code": "expect_not_object", "index": index}]
+    out: list[dict] = []
+    metric = expect.get("metric")
+    if not isinstance(metric, str) or not metric.strip():
+        out.append({"code": "expect_metric_invalid", "index": index})
+    comparators = [key for key in ("delta_db", "max", "min") if key in expect]
+    if len(comparators) != 1:
+        out.append({"code": "expect_comparator", "index": index})
+    for key in comparators:
+        if _number(expect.get(key)) is None:
+            out.append({"code": "expect_value_invalid", "index": index, "field": key})
+    tolerance = expect.get("tolerance_db", 0.0)
+    if _number(tolerance) is None or float(tolerance) < 0:
+        out.append({"code": "expect_tolerance_invalid", "index": index})
+    if isinstance(metric, str) and metric.startswith("stem."):
+        if not isinstance(expect.get("stem"), str) or not expect["stem"].strip():
+            out.append({"code": "expect_stem_missing", "index": index})
+    return out
 
 
 def _limiter_violations(action: dict, index: int) -> list[dict]:
@@ -579,6 +793,7 @@ def validate_recipe(recipe: list) -> list[dict]:
     if send_back and len(recipe) > 1:
         violations.append({"code": "send_back_not_terminal"})
     corrective = 0.0
+    ids: dict[str, int] = {}
     for index, action in enumerate(recipe):
         if not isinstance(action, dict):
             violations.append({"code": "not_an_action", "index": index}); continue
@@ -590,6 +805,16 @@ def validate_recipe(recipe: list) -> list[dict]:
         if action.get("schema") != RECIPE_SCHEMA_VERSION:
             violations.append({"code": "schema_mismatch", "index": index,
                                "schema": action.get("schema")})
+        if "id" in action:
+            action_id = action["id"]
+            if not isinstance(action_id, str) or not action_id.strip():
+                violations.append({"code": "action_id_invalid", "index": index})
+            elif action_id in ids:
+                violations.append({"code": "action_id_duplicate", "index": index,
+                                   "id": action_id, "first_index": ids[action_id]})
+            else:
+                ids[action_id] = index
+        violations.extend(_expect_violations(action, index))
         if name == "eq.bell" and action.get("role") == "corrective":
             gain = abs(float(action.get("gain_db", 0.0)))
             if gain > GATE["max_corrective_db_per_point"]:
@@ -627,12 +852,22 @@ def mix_warnings(answers: dict, stems: list[str],
         out.append(f"no exported stem matches {role!r}; the fader move was omitted "
                    f"(stems: {[s.split('/')[-1] for s in stems]})")
 
-    masking = _score(answers, "masking")
-    requested = masking - MASKING_SCORE_BASE
-    if masking >= MASKING_SCORE_THRESHOLD and requested > GATE["max_corrective_db_per_point"]:
-        out.append(f"masking score {masking:g} asks for {round(requested, 1)} dB at 300 Hz, "
-                   f"above the {GATE['max_corrective_db_per_point']} dB corrective cap; the "
-                   f"bell is capped and the remaining imbalance is structural, not EQ-shaped")
+    plan = _masking_plan(answers, stem_facts)
+    if plan:
+        requested = plan["score"] - MASKING_SCORE_BASE
+        if requested > GATE["max_corrective_db_per_point"]:
+            where = (f"at {plan['freq_hz']} Hz" if plan["freq_hz"]
+                     else "(frequency unmeasured)")
+            out.append(f"masking score {plan['score']:g} asks for {round(requested, 1)} dB "
+                       f"{where}, above the {GATE['max_corrective_db_per_point']} dB "
+                       f"corrective cap; the bell is capped and the remaining imbalance is "
+                       f"structural, not EQ-shaped")
+        if plan["status"] == "unmeasured":
+            out.append("masking was scored but no stem band data was measured; no bell was "
+                       "emitted rather than guessing a frequency")
+        elif plan["status"] == "low_band_only":
+            out.append("the measured overlap is in sub/bass only; a bus EQ bell would not "
+                       "fix it — rebalance the low end with faders or a high-pass")
 
     for stem in stem_facts or []:
         path = str(stem.get("path", ""))
@@ -662,16 +897,21 @@ def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | N
         target, gain = moves[balance]
         stem = _match_stem(stems, target)
         if stem:
-            recipe.append(_action("fader", target=target, gain_db=clamp(gain, -3.0, 3.0),
-                                  stem=stem))
-    masking = _score(answers, "masking")
-    if masking >= MASKING_SCORE_THRESHOLD:
+            move = clamp(gain, -3.0, 3.0)
+            recipe.append(_action("fader", target=target, gain_db=move, stem=stem,
+                                  expect=_expect_delta("stem.integrated_lufs", move,
+                                                       1.0, stem=stem)))
+    plan = _masking_plan(answers, stem_facts)
+    if plan and plan["status"] == "measured":
         # Over-cap requests are capped, and mix_warnings names the cap so the
         # hidden imbalance is not silently presented as an EQ-shaped problem.
-        cut = clamp(masking - MASKING_SCORE_BASE, 0.0,
-                    GATE["max_corrective_db_per_point"])
-        recipe.append(_action("eq.bell", target="bus", freq_hz=300,
-                              gain_db=-cut, q=4.0, role="corrective"))
+        recipe.append(_action("eq.bell", target="bus", freq_hz=plan["freq_hz"],
+                              gain_db=-plan["cut_db"], q=4.0, role="corrective",
+                              band=plan["band"], stems=plan["stems"],
+                              reason="measured_band_overlap",
+                              expect=_expect_delta(
+                                  f"spectral.bands_db_rel.{plan['band']}",
+                                  -plan["cut_db"], 1.5)))
     # Gain staging is arithmetic, not taste: bring every stem toward -18 LUFS.
     for stem in stem_facts or []:
         lufs = _number(stem.get("integrated_lufs"))
@@ -681,7 +921,10 @@ def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | N
                      GAIN_STAGING_MAX_MOVE_DB)
         if abs(move) >= 1.0:
             recipe.append(_action("fader", target="stem", gain_db=round(move, 1),
-                                  stem=stem["path"], reason="gain_staging"))
+                                  stem=stem["path"], reason="gain_staging",
+                                  expect=_expect_delta("stem.integrated_lufs",
+                                                       round(move, 1), 1.0,
+                                                       stem=stem["path"])))
 
     # Phase before EQ: a cancelling stem gets polarity, not a filter.
     if _choice(answers, "phase_before_eq") == "polarity":
@@ -704,7 +947,7 @@ def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | N
     if _choice(answers, "bus_comp") == "glue":
         recipe.append(_action("compressor", target="mix_bus", ratio=2.0, attack_ms=30,
                               release_ms=250, gain_reduction_db=2.0))
-    return recipe
+    return _finalize(recipe)
 
 
 STEM_SYNONYMS = {
