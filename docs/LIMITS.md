@@ -37,11 +37,11 @@ implemented (`analyze_sections`, `analyze_reference`, `judge_master.previous_pat
 
 | Metric | Reality |
 |---|---|
-| `integrated_lufs` | `pyloudnorm` when installed; otherwise a K-weighting + RMS approximation, ±0.5 LU |
-| `true_peak_dbtp` | 4× oversampled (BS.1770 minimum). Dedicated meters use 8× — expect ±0.3 dB |
-| `loudness_range_lu` | short-term P95−P10, indicative |
+| `integrated_lufs` | `pyloudnorm` when installed; otherwise K-weighting with coefficients derived for the actual sample rate (44.1/48/96 kHz agree with `pyloudnorm` within ~0.2 LU) |
+| `true_peak_dbtp` | 4× polyphase FIR over the whole file, edges included (BS.1770 minimum). Dedicated meters use 8× — expect ±0.3 dB on normal material, more near Nyquist |
+| `loudness_range_lu` | EBU R128 / Tech 3342: K-weighted 3 s short-term loudness, −70 LUFS absolute gate, −20 LU relative gate, P95−P10. `null` when the file is shorter than 3 s |
 | `phase_correlation` | one number for the whole file; it does not localize |
-| masking matrix | average band overlap, not perceptual masking |
+| `band_overlap_pairs` | average per-band minimum of relative band energy: a spectral-crowding proxy, not perceptual masking |
 | noise floor | measurable **only inside a real gap**; returns `None` on continuous music |
 | lossy detection | a cliff test at 16 kHz; a 22 kHz cut on a 44.1 kHz file still looks "full band" |
 | stem gates | need named stems (`vocals`, `drums`, `bass`); an unnamed export cannot be role-matched |
@@ -58,6 +58,8 @@ look identical to a band-energy vector.
 ## Jev specifics
 
 * It decides over the state it is given. Thin state → thin judgement.
+* The state contains **file basenames, never absolute paths**: the decision service does not need
+  the local user name or directory layout. `analyze_*` still returns full paths to the local client.
 * Its `score` scale is 2–10 levels; it saturates. In our tests "muddy" hit the ceiling on already-dark
   material and stopped responding.
 * Its confidence is calibrated by design, but **not validated for this domain yet**. Do not threshold

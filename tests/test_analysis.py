@@ -285,6 +285,141 @@ def test_json_safe_output():
     json.dumps(facts)          # numpy scalars would raise here
 
 
+# ---------------------------------------------------------------------------
+# sample-rate, stereo, edge and R128 regressions
+# ---------------------------------------------------------------------------
+def _fallback_lufs(x, sr):
+    """Run integrated_lufs without pyloudnorm, even when it is installed."""
+    import sys
+    saved = sys.modules.get("pyloudnorm")
+    sys.modules["pyloudnorm"] = None
+    try:
+        return analysis.integrated_lufs(x, sr)
+    finally:
+        if saved is None:
+            del sys.modules["pyloudnorm"]
+        else:
+            sys.modules["pyloudnorm"] = saved
+
+
+def test_k_weighting_coefficients_are_derived_for_48k():
+    """The ITU parameterisation must reproduce the published 48 kHz constants."""
+    b1, a1, b2, a2 = analysis._k_coefficients(48000)
+    np.testing.assert_allclose(
+        b1, [1.53512485958697, -2.69169618940638, 1.19839281085285], atol=1e-6)
+    np.testing.assert_allclose(
+        a1, [1.0, -1.69065929318241, 0.73248077421585], atol=1e-6)
+    np.testing.assert_allclose(
+        a2, [1.0, -1.99004745483398, 0.99007225036621], atol=1e-6)
+    assert not np.allclose(analysis._k_coefficients(96000)[0], b1)
+
+
+def test_fallback_lufs_is_correct_at_any_sample_rate():
+    """Fixed 48 kHz coefficients misread 44.1/96 kHz files by up to ~1.7 LU."""
+    for sr in (44100, 48000, 96000):
+        t = np.arange(sr * 4) / sr
+        x = (0.1 * np.sqrt(2) * np.sin(2 * np.pi * 997 * t)).reshape(-1, 1)
+        assert abs(_fallback_lufs(x, sr) - (-20.0)) < 0.5, (sr, _fallback_lufs(x, sr))
+
+
+def test_fallback_lufs_matches_pyloudnorm_when_installed():
+    try:
+        import pyloudnorm as pyln
+    except ImportError:
+        return                                # optional dependency: nothing to compare
+    for sr in (44100, 48000, 96000):
+        t = np.arange(sr * 8) / sr
+        mono = (0.15 * np.sin(2 * np.pi * 110 * t) + 0.08 * np.sin(2 * np.pi * 997 * t)
+                + 0.05 * np.sin(2 * np.pi * 3000 * t)
+                + 0.02 * np.random.default_rng(0).normal(size=len(t)))
+        x = np.stack([mono, mono], axis=1)
+        exact = pyln.Meter(sr).integrated_loudness(x)
+        assert abs(_fallback_lufs(x, sr) - exact) < 0.3, (sr, exact)
+
+
+def test_reference_loudness_is_not_a_mono_fold_down():
+    """Correlated stereo reads ~3 LU above the same signal averaged to mono."""
+    t = np.arange(SR * 5) / SR
+    mono = 0.1 * np.sqrt(2) * np.sin(2 * np.pi * 997 * t)
+    ref = analysis.analyze_reference(_wav(np.stack([mono, mono], axis=1)))
+    folded = analysis.integrated_lufs(mono.reshape(-1, 1), SR)
+    assert abs((ref["integrated_lufs"] - folded) - 3.0) < 0.2, (ref["integrated_lufs"], folded)
+
+
+def test_reference_true_peak_survives_out_of_phase_stereo():
+    """A mono fold-down cancels this file; true peak must still see it."""
+    t = np.arange(SR * 2) / SR
+    left = 0.6 * np.sin(2 * np.pi * 997 * t)
+    ref = analysis.analyze_reference(_wav(np.stack([left, -left], axis=1)))
+    assert ref["true_peak_dbtp"] > -5.0, ref["true_peak_dbtp"]
+
+
+def test_section_loudness_is_measured_in_stereo():
+    t = np.arange(SR * 18) / SR
+    mono = 0.1 * np.sqrt(2) * np.sin(2 * np.pi * 997 * t)
+    facts = analysis.analyze_sections(_wav(np.stack([mono, mono], axis=1)), window_s=6.0)
+    folded = analysis.integrated_lufs(mono[: SR * 6].reshape(-1, 1), SR)
+    assert abs((facts["windows"][0]["integrated_lufs"] - folded) - 3.0) < 0.2
+
+
+def test_true_peak_covers_the_first_and_last_samples():
+    """The old block estimate discarded a quarter block at each edge."""
+    n = SR * 2
+    for pos in (0, n // 2, -1, -100):
+        x = np.zeros(n)
+        x[pos] = 0.9
+        tp = analysis.true_peak_dbtp(x, SR)
+        assert abs(tp - (-0.92)) < 0.2, (pos, tp)
+
+
+def test_loudness_range_gates_silence():
+    """Unweighted RMS windows counted silence and inflated LRA past 100 LU."""
+    t = np.arange(SR * 10) / SR
+    tone = 0.2 * np.sin(2 * np.pi * 997 * t)
+    assert analysis.loudness_range(tone, SR) < 1.0
+    with_silence = np.concatenate([tone, np.zeros(SR * 10)])
+    assert analysis.loudness_range(with_silence, SR) < 6.0
+
+
+def test_loudness_range_measures_dynamics():
+    t = np.arange(SR * 6) / SR
+    loud = 0.2 * np.sin(2 * np.pi * 997 * t)
+    quiet = 0.02 * np.sin(2 * np.pi * 997 * t)
+    lra = analysis.loudness_range(np.concatenate([loud, quiet, loud, quiet]), SR)
+    assert 15.0 < lra < 25.0, lra
+
+
+def test_loudness_range_is_unmeasured_below_one_window():
+    assert analysis.loudness_range(np.zeros(SR), SR) is None
+
+
+def test_spectrum_averages_the_whole_file_not_just_the_centre():
+    """A whole-file Hann window hid a burst at the start by ~39 dB."""
+    n = SR * 10
+    t = np.arange(n) / SR
+    base = 0.1 * np.sin(2 * np.pi * 440 * t)
+    burst = 0.05 * np.sin(2 * np.pi * 10000 * np.arange(SR // 2) / SR)
+    at_start, in_middle = base.copy(), base.copy()
+    at_start[: len(burst)] += burst
+    in_middle[n // 2: n // 2 + len(burst)] += burst
+    a = analysis.bands_db_rel(at_start, SR)["high"]
+    b = analysis.bands_db_rel(in_middle, SR)["high"]
+    assert abs(a - b) < 2.0, (a, b)
+
+
+def test_jev_facts_have_no_absolute_paths():
+    import engineer_server
+    facts = analysis.analyze_master(_wav(_sine(440, 0.3)))
+    assert os.path.isabs(facts["file"])                 # local API keeps it
+    safe = engineer_server._jev_facts(facts)
+    assert safe["file"] == "t.wav" and "/" not in safe["file"]
+
+    stems = analysis.analyze_stems([_wav(_sine(300, 0.3), name="01_vocals.wav")])
+    safe_stems = engineer_server._jev_facts(stems)
+    assert safe_stems["stems"][0]["path"] == "01_vocals.wav"
+    assert "band_overlap_pairs" in stems and "masking_pairs" not in stems
+
+
 if __name__ == "__main__":
     failures = 0
     for name, fn in sorted(globals().items()):

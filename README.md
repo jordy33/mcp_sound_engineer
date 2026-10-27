@@ -88,7 +88,7 @@ Register it in any MCP client, next to your DAW adapter — they are separate se
 | Tool | Input | Returns |
 |---|---|---|
 | `analyze_master` | one stereo file | LUFS, true peak, LRA, crest, phase correlation, 6 bands, 5–9 kHz sibilance, centroid, clipping |
-| `analyze_stems` | N files | per-stem loudness, bands, sibilance, low-band correlation, pairwise masking, and stem gates (buried vocal, outlier element, mono bass) |
+| `analyze_stems` | N files | per-stem loudness, bands, sibilance, low-band correlation, pairwise band overlap (a spectral-crowding proxy, not perceptual masking), and stem gates (buried vocal, outlier element, mono bass) |
 | `analyze_sections` | path + window | per-window LUFS/bands/correlation and which windows deviate from the median |
 | `analyze_reference` | path | a commercial reference's band balance and sibilance, to feed `judge_master` |
 | `validate_recipe` | recipe | adapter-side contract check: caps, schema, limiter control fields, terminal `send_back` |
@@ -277,14 +277,14 @@ Measured on 24 real music clips (8 tracks × 3 versions: original, +3.4 dB at 60
 | Direction on +3.4 dB of added lows | 5/8 (both failures were scale saturation) |
 | Spearman(measured tilt, "bright") | +0.77 |
 | Stability across runs | ±1 point |
-| End-to-end on a full 284 s track | 2.9 s per call |
+| End-to-end on a full 284 s track | ≈6 s per call (numpy-only: K-weighting + 4× true peak) |
 
 **Not** verified: no human labels, one repetition per clip, synthetic perturbations. It measures
 sensitivity to a known change, not agreement with a trained ear.
 
 ## 8. Status
 
-`0.6.1` (rules 2.1.1). Measurement, gates, sections, references, the recipe contract and a
+`0.7.0` (rules 2.1.2). Measurement, gates, sections, references, the recipe contract and a
 closed apply → export → measure → iterate loop are in place, with CI on 3.9/3.11/3.12. What is
 still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
 

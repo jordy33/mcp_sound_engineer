@@ -15,7 +15,7 @@ import math
 import os
 import re
 
-RULES_VERSION = "2.1.1"
+RULES_VERSION = "2.1.2"
 RECIPE_SCHEMA_VERSION = "2.1.0"
 
 # --- Gates: when to refuse to master a mix -----------------------------------

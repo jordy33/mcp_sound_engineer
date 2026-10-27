@@ -7,6 +7,7 @@ executable, DAW-neutral recipe. Applying it is another server's job.
 from __future__ import annotations
 
 import json
+import os
 import sys
 
 try:  # installed as a package
@@ -19,11 +20,27 @@ except ImportError:  # executed as a script: python server/engineer_server.py
     from jev import ask, config
 
 SERVER_NAME = "mcp_sound_engineer"
-SERVER_VERSION = "0.6.1"
+SERVER_VERSION = "0.7.0"
 
 # Jev schemas live in rules.py: one source of truth for the answer keys.
 MASTER_QUESTIONS = rules.MASTER_QUESTIONS
 MIX_QUESTIONS = rules.MIX_QUESTIONS
+
+
+def _jev_facts(facts: dict) -> dict:
+    """Facts as sent to Jev: no local filesystem paths.
+
+    `facts` is also returned to the local MCP client, where the absolute path is
+    useful. A third-party decision service only needs to know which file it is,
+    not the user name and directory layout that produced it.
+    """
+    safe = json.loads(json.dumps(facts))
+    if isinstance(safe.get("file"), str):
+        safe["file"] = os.path.basename(safe["file"])
+    for stem in safe.get("stems") or []:
+        if isinstance(stem, dict) and isinstance(stem.get("path"), str):
+            stem["path"] = os.path.basename(stem["path"])
+    return safe
 
 
 # --------------------------------------------------------------------------
@@ -78,7 +95,7 @@ def tool_judge_master(path: str, platform: str = "spotify",
                     "delivery_true_peak_ceiling": target["true_peak_ceiling"],
                     "note": "streaming loudness is normalized on playback; the master is not "
                             "required to reach the normalization figure"},
-        "facts": facts,
+        "facts": _jev_facts(facts),
         "reference_curve": reference_curve,
         "limits": rules.GATE,
     }
@@ -111,7 +128,8 @@ def tool_judge_master(path: str, platform: str = "spotify",
 
 def tool_judge_mix(paths: list[str]) -> dict:
     facts = analyze_stems(paths)
-    state = {"context": {"stage": "mixing"}, "facts": facts, "limits": rules.GATE}
+    state = {"context": {"stage": "mixing"}, "facts": _jev_facts(facts),
+             "limits": rules.GATE}
     answers = ask(state, MIX_QUESTIONS)
     names = [s["path"] for s in facts["stems"]]
     confidence = rules.confidence_report(answers)

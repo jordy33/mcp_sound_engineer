@@ -81,13 +81,38 @@ def _mono(x: np.ndarray) -> np.ndarray:
     return x.mean(axis=1) if x.ndim == 2 and x.shape[1] > 1 else x.reshape(-1)
 
 
+def _welch_psd(mono: np.ndarray, sr: int, nperseg: int = 8192) -> tuple[np.ndarray, np.ndarray]:
+    """Averaged periodogram (Welch, 50 % overlap, Hann).
+
+    One FFT over the whole file weights its centre and nearly ignores intro/outro.
+    Welch averages every 8192-sample segment with 50 % overlap, so a loud section
+    is not swallowed by the analysis window.
+    """
+    x = np.asarray(mono, dtype=np.float64).reshape(-1)
+    n = len(x)
+    if n < 2:
+        return np.zeros(1), np.zeros(1)
+    seg = min(nperseg, n)
+    window = np.hanning(seg)
+    step = max(1, seg // 2)
+    starts = range(0, n - seg + 1, step) if n >= seg else [0]
+    acc = np.zeros(seg // 2 + 1)
+    count = 0
+    for start in starts:
+        chunk = x[start:start + seg]
+        if len(chunk) < seg:
+            chunk = np.pad(chunk, (0, seg - len(chunk)))
+        acc += np.abs(np.fft.rfft(chunk * window)) ** 2
+        count += 1
+    return np.fft.rfftfreq(seg, 1 / sr), acc / max(1, count)
+
+
 def bands_db_rel(mono: np.ndarray, sr: int,
                  bands: dict[str, tuple[float, float]] | None = None) -> dict[str, float]:
     bands = BANDS if bands is None else bands
-    spec = np.abs(np.fft.rfft(mono * np.hanning(len(mono)))) ** 2
-    freqs = np.fft.rfftfreq(len(mono), 1 / sr)
-    total = float(spec.sum()) + 1e-12
-    return {name: round(10 * np.log10(float(spec[(freqs >= lo) & (freqs < hi)].sum()) / total + 1e-12), 1)
+    freqs, psd = _welch_psd(mono, sr)
+    total = float(psd.sum()) + 1e-12
+    return {name: round(10 * np.log10(float(psd[(freqs >= lo) & (freqs < hi)].sum()) / total + 1e-12), 1)
             for name, (lo, hi) in bands.items()}
 
 
@@ -105,7 +130,9 @@ def integrated_lufs(data, sr: int) -> float:
     x = np.atleast_2d(data if data.ndim > 1 else data.reshape(-1, 1))
     try:
         import pyloudnorm as pyln  # exact, optional
-        return round(float(pyln.Meter(sr).integrated_loudness(x)), 2)
+        exact = float(pyln.Meter(sr).integrated_loudness(x))
+        if np.isfinite(exact):
+            return round(exact, 2)
     except Exception:
         pass
 
@@ -133,6 +160,35 @@ def integrated_lufs(data, sr: int) -> float:
     return round(-0.691 + 10 * np.log10(float(np.mean(keep))), 2)
 
 
+def _k_coefficients(sr: int) -> tuple[np.ndarray, np.ndarray, np.ndarray, np.ndarray]:
+    """BS.1770 K-weighting biquads derived for the actual sample rate.
+
+    The tabulated coefficients are only valid at 48 kHz. Reusing them at 44.1 or
+    96 kHz, as this module used to do, moved the shelf and misread loudness by up
+    to ~1.7 LU. These formulas are the ITU parameterisation (same response as the
+    published 48 kHz constants).
+    """
+    # Stage 1 — high-shelf (head-related filter).
+    f0, gain, q = 1681.974450955533, 3.999843853973347, 0.7071752369554196
+    k = np.tan(np.pi * f0 / sr)
+    vh = 10.0 ** (gain / 20.0)
+    vb = vh ** 0.4996667741545416
+    a0 = 1.0 + k / q + k * k
+    b1 = np.array([(vh + vb * k / q + k * k) / a0,
+                   2.0 * (k * k - vh) / a0,
+                   (vh - vb * k / q + k * k) / a0])
+    a1 = np.array([1.0,
+                   2.0 * (k * k - 1.0) / a0,
+                   (1.0 - k / q + k * k) / a0])
+    # Stage 2 — 38 Hz high-pass.
+    f0, q = 38.13547087602444, 0.5003270373238773
+    k = np.tan(np.pi * f0 / sr)
+    den = 1.0 + k / q + k * k
+    b2 = np.array([1.0, -2.0, 1.0])
+    a2 = np.array([1.0, 2.0 * (k * k - 1.0) / den, (1.0 - k / q + k * k) / den])
+    return b1, a1, b2, a2
+
+
 def _k_weighted(mono: np.ndarray, sr: int) -> np.ndarray:
     """K-weighting in the frequency domain (same magnitude response as the biquads)."""
     x = mono.astype(np.float64)
@@ -141,57 +197,86 @@ def _k_weighted(mono: np.ndarray, sr: int) -> np.ndarray:
     freqs = np.fft.rfftfreq(n, 1 / sr)
     z = np.exp(-2j * np.pi * freqs / sr)
     z2 = z * z
+    b1, a1, b2, a2 = _k_coefficients(sr)
 
     def response(b, a):
         return (b[0] + b[1] * z + b[2] * z2) / (a[0] + a[1] * z + a[2] * z2)
 
-    h = response(np.array([1.53512485958697, -2.69169618940638, 1.19839281085285]),
-                 np.array([1.0, -1.69065929318241, 0.73248077421585]))
-    h *= response(np.array([1.0, -2.0, 1.0]),
-                  np.array([1.0, -1.99004745483398, 0.99007225036621]))
+    h = response(b1, a1) * response(b2, a2)
     return np.fft.irfft(spec * h, n=n)
 
 
-def _oversampled(x: np.ndarray, oversample: int) -> np.ndarray:
-    spec = np.fft.rfft(x)
-    return np.fft.irfft(spec, n=len(x) * oversample) * oversample
+def _interp_phases(oversample: int = 4, half_taps: int = 8) -> list[np.ndarray]:
+    """Windowed-sinc polyphase filters for `oversample`x interpolation.
+
+    Each phase has unity DC gain, so a constant reads itself. Eight zero crossings
+    each side gives ~80 dB image rejection with 65 taps.
+    """
+    n_taps = 2 * half_taps * oversample + 1
+    t = np.arange(n_taps) - (n_taps - 1) / 2.0
+    h = np.sinc(t / oversample) * np.kaiser(n_taps, 8.0)
+    return [h[p::oversample] / h[p::oversample].sum() for p in range(oversample)]
+
+
+def _true_peak_channel(ch: np.ndarray, phases: list[np.ndarray]) -> float:
+    """Peak of one channel after polyphase interpolation, boundaries included.
+
+    Convolving the *whole* channel (not central slices of blocks) is what makes
+    the first and last samples measurable: the old block version discarded a
+    quarter block at each edge, so an impulse at the start read -76 dBTP and one
+    at the end read -240 dBTP.
+    """
+    peak = float(np.max(np.abs(ch))) if ch.size else 0.0
+    # Phase 0 is the signal itself (the sample peak above already covers it);
+    # only the fractional-delay phases can reveal an inter-sample peak.
+    for phase in phases[1:]:
+        y = np.convolve(ch, phase, mode="full")
+        peak = max(peak, float(np.max(np.abs(y))))
+    return peak
 
 
 def true_peak_dbtp(data, sr: int, oversample: int = 4) -> float:
-    """Inter-sample peak per channel (BS.1770 4x), with block edges discarded.
-
-    Zero-padding in the frequency domain creates boundary ringing; taking only the
-    middle of each overlapped block keeps the estimate honest (a pure tone used to
-    read +1.2 dB high).
-    """
+    """Inter-sample true peak per BS.1770 (4x minimum), summed across channels by max."""
     x = np.atleast_2d(data if data.ndim > 1 else data.reshape(-1, 1)).astype(np.float64)
-    block, peak = 8192, 0.0
-    for c in range(x.shape[1]):
-        ch = x[:, c]
-        if len(ch) <= block:
-            up = _oversampled(np.pad(ch, (0, block - len(ch))), oversample)
-            peak = max(peak, float(np.max(np.abs(up[: max(1, len(ch) * oversample)]))))
-            continue
-        edge = block // 4 * oversample
-        for i in range(0, len(ch) - block + 1, block // 2):
-            up = _oversampled(ch[i:i + block], oversample)
-            middle = up[edge:len(up) - edge]
-            peak = max(peak, float(np.max(np.abs(middle))))
+    phases = _interp_phases(oversample)
+    peak = max(_true_peak_channel(x[:, c], phases) for c in range(x.shape[1]))
     return round(20 * np.log10(peak + 1e-12), 2)
 
 
-def loudness_range(mono: np.ndarray, sr: int, win_s: float = 3.0) -> float:
-    win = int(win_s * sr)
-    if len(mono) <= win:
+def loudness_range(data, sr: int, win_s: float = 3.0, hop_s: float = 0.1) -> float | None:
+    """EBU R128 loudness range (LU), per EBU Tech 3342.
+
+    K-weighted 3 s short-term loudness every 100 ms, absolute gate at -70 LUFS,
+    relative gate 20 LU below the gated mean, then P95 - P10 of what survives.
+
+    The previous implementation used unweighted RMS windows with no gating and
+    its own percentiles: a metric that does not mean what `loudness_range_lu`
+    means to every other tool. Returns None when the file is shorter than one
+    window (the range is not measurable, not zero).
+    """
+    x = np.atleast_2d(data if data.ndim > 1 else data.reshape(-1, 1)).astype(np.float64)
+    n = x.shape[0]
+    win = int(round(win_s * sr))
+    if n < win:
+        return None
+    hop = max(1, int(round(hop_s * sr)))
+    power = np.zeros(n)
+    for c in range(x.shape[1]):
+        power += _k_weighted(x[:, c], sr) ** 2
+    cumulative = np.concatenate(([0.0], np.cumsum(power)))
+    starts = np.arange(0, n - win + 1, hop)
+    means = (cumulative[starts + win] - cumulative[starts]) / win
+    short_term = -0.691 + 10.0 * np.log10(means + 1e-20)
+
+    keep = short_term > -70.0                    # absolute gate
+    if not keep.any():
         return 0.0
-    step = max(1, win // 2)
-    vals = []
-    for start in range(0, len(mono) - win, step):
-        seg = mono[start:start + win]
-        vals.append(20 * np.log10(np.sqrt(np.mean(seg ** 2)) + 1e-12))
-    if not vals:
+    gated_means, gated_lufs = means[keep], short_term[keep]
+    relative = -0.691 + 10.0 * np.log10(float(np.mean(gated_means))) - 20.0
+    gated_lufs = gated_lufs[gated_lufs > relative]  # relative gate
+    if gated_lufs.size == 0:
         return 0.0
-    return round(float(np.percentile(vals, 95) - np.percentile(vals, 10)), 2)
+    return round(float(np.percentile(gated_lufs, 95) - np.percentile(gated_lufs, 10)), 2)
 
 
 def stereo_correlation(stereo: np.ndarray) -> float:
@@ -253,8 +338,7 @@ def spectral_cutoff(mono: np.ndarray, sr: int) -> dict:
         return {"cutoff_hz": round(nyquist), "drop_db": 0.0, "lossy_suspected": False,
                 "note": "sample rate too low to test the 14-18 kHz region"}
     seg = mono[: sr * 60] if len(mono) > sr * 60 else mono
-    spec = np.abs(np.fft.rfft(seg * np.hanning(len(seg)))) ** 2
-    freqs = np.fft.rfftfreq(len(seg), 1 / sr)
+    freqs, spec = _welch_psd(seg, sr)
 
     def band_db(lo, hi):
         total = float(spec.sum()) + 1e-12
@@ -278,7 +362,7 @@ def analyze_master(path: str) -> dict:
         "bit_depth": _wav_bit_depth(path),
         "loudness": {
             "integrated_lufs": integrated_lufs(data, sr),
-            "loudness_range_lu": loudness_range(mono, sr),
+            "loudness_range_lu": loudness_range(data, sr),
             "true_peak_dbtp": true_peak_dbtp(data, sr),
             "sample_peak_dbfs": round(20 * np.log10(peak + 1e-12), 2),
             "crest_db": round(20 * np.log10(peak / rms + 1e-12), 2),
@@ -308,9 +392,8 @@ def _wav_bit_depth(path: str) -> int | None:
 
 
 def _centroid(mono: np.ndarray, sr: int) -> int:
-    spec = np.abs(np.fft.rfft(mono * np.hanning(len(mono)))) ** 2
-    freqs = np.fft.rfftfreq(len(mono), 1 / sr)
-    return int(float((freqs * spec).sum() / (spec.sum() + 1e-12)))
+    freqs, psd = _welch_psd(mono, sr)
+    return int(float((freqs * psd).sum() / (psd.sum() + 1e-12)))
 
 
 def low_band_correlation(stereo: np.ndarray, sr: int, cutoff_hz: float = 120.0) -> float:
@@ -339,9 +422,11 @@ def analyze_reference(path: str) -> dict:
         "file": os.path.abspath(path),
         "reference_curve": bands_db_rel(mono, sr),
         "sibilance_db_rel": sibilance_db_rel(mono, sr),
-        "integrated_lufs": integrated_lufs(mono, sr),
-        "true_peak_dbtp": true_peak_dbtp(mono, sr),
-        "loudness_range_lu": loudness_range(mono, sr),
+        # Loudness and peaks are summed across channels, not read from the mono
+        # fold-down: that under-reported a correlated stereo reference by ~3 LU.
+        "integrated_lufs": integrated_lufs(data, sr),
+        "true_peak_dbtp": true_peak_dbtp(data, sr),
+        "loudness_range_lu": loudness_range(data, sr),
         "phase_correlation": stereo_correlation(data),
     })
 
@@ -358,7 +443,8 @@ def analyze_sections(path: str, window_s: float = 30.0) -> dict:
     for start in range(0, len(mono) - win + 1, win):
         seg, chunk = mono[start:start + win], data[start:start + win]
         windows.append({"start_s": round(start / sr, 1),
-                        "integrated_lufs": integrated_lufs(seg, sr),
+                        # measure the stereo window: a mono fold-down reads ~3 LU low
+                        "integrated_lufs": integrated_lufs(chunk, sr),
                         "bands_db_rel": bands_db_rel(seg, sr),
                         "phase_correlation": stereo_correlation(chunk)})
     median_lufs = float(np.median([w["integrated_lufs"] for w in windows]))
@@ -401,15 +487,19 @@ def analyze_stems(paths: list[str]) -> dict:
             "sibilance_db_rel": sibilance_db_rel(mono, sr),
             "low_correlation": low_band_correlation(data, sr),
         })
-    masking = []
+    overlap_pairs = []
     for i in range(len(stems)):
         for j in range(i + 1, len(stems)):
             a, b = stems[i], stems[j]
             overlap = sum(min(a["bands_db_rel"][k], b["bands_db_rel"][k])
                           for k in BANDS) / len(BANDS)
-            masking.append({"a": a["name"], "b": b["name"], "band_overlap_db": round(overlap, 2)})
-    masking.sort(key=lambda m: -m["band_overlap_db"])
-    return plain({"stems": stems, "masking_pairs": masking[:5],
+            overlap_pairs.append({"a": a["name"], "b": b["name"],
+                                  "band_overlap_db": round(overlap, 2)})
+    overlap_pairs.sort(key=lambda m: -m["band_overlap_db"])
+    return plain({"stems": stems,
+                  "band_overlap_pairs": overlap_pairs[:5],
+                  "band_overlap_note": "mean per-band minimum of relative band energy; "
+                                       "a spectral-crowding proxy, not perceptual masking",
                   "gates": stem_gates(stems)})
 
 
