@@ -1,9 +1,9 @@
-# Recipe schema 2.1.0
+# Recipe schema 2.2.0
 
 A recipe is an ordered array of actions. Order matters: it is the signal chain.
 
 ```json
-{"action": "eq.bell", "target": "master", "schema": "2.1.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"}
+{"id": "eq-bell:master:bass", "action": "eq.bell", "target": "master", "schema": "2.2.0", "freq_hz": 150, "gain_db": -2.0, "q": 4.0, "role": "corrective", "expect": {"metric": "spectral.bands_db_rel.bass", "delta_db": -2.0, "tolerance_db": 1.5}}
 ```
 
 ## Common fields
@@ -12,17 +12,41 @@ A recipe is an ordered array of actions. Order matters: it is the signal chain.
 |---|---|---|
 | `action` | yes | one of the vocabulary below |
 | `target` | yes | `master`, `mix_bus`, `bus`, `vocal`, `drums`, `bass`, `stem` |
-| `schema` | yes | `2.1.0` |
+| `schema` | yes | `2.2.0` |
+| `id` | no (generated) | stable identifier derived from the action, target and band/stem; a report can point at the same action after a bounce |
 | `stem` | for stem-targeted moves | exported basename/path; the adapter resolves it before a role key |
 | `reason` | no | human-readable justification |
 | `role` | no | `corrective` or `tonal` (counts toward the 6 dB cap only if corrective) |
+| `expect` | no | the measured consequence of the action, used by `verify_recipe`; see below |
+
+### `expect`
+
+`expect` is an optional measurement contract, not a promise:
+
+```json
+{"metric": "spectral.bands_db_rel.bass", "delta_db": -2.0, "tolerance_db": 1.5}
+{"metric": "loudness.true_peak_dbtp", "max": -1.0, "tolerance_db": 0.1}
+{"metric": "stem.integrated_lufs", "stem": "01_vocals.wav", "delta_db": -2.0, "tolerance_db": 1.0}
+```
+
+* Exactly one of `delta_db`, `max` or `min` is required.
+* `metric` is a dotted path into `analyze_master` facts (`spectral.bands_db_rel.mid`,
+  `loudness.true_peak_dbtp`, `loudness.integrated_lufs`, …). A `stem.` metric requires `stem`;
+  `verify_recipe` needs the corresponding before/after stem lists.
+* `tolerance_db` defaults to `0.0`.
+* The verifier returns `met`, `missed` or `unmeasured`. A missing metric is **never** upgraded to
+  `met`. Expect only appears where a real measurement exists: compressor ratio, polarity, dither
+  and stereo width have none, so they carry no `expect`.
+
+`dry_run` is an execution flag, not an action field: the adapter CLI and loop write nothing unless
+`--apply` is given. There is no per-action dry-run.
 
 ## Vocabulary
 
 | action | parameters |
 |---|---|
 | `eq.high_pass` | `freq_hz` 20–30, `slope_db_oct` 6–12 |
-| `eq.bell` | `freq_hz`, `gain_db` (corrective ≤ −3), `q` 4–8 corrective / 0.5–1.5 tonal |
+| `eq.bell` | `freq_hz`, `gain_db` (corrective ≤ −3), `q` 4–8 corrective / 0.5–1.5 tonal; a masking bell also carries the measured `band` and `stems` pair |
 | `eq.shelf` | `freq_hz`, `gain_db`, `q` 0.5–1.5 |
 | `compressor` | `ratio` 1.5–3.0, `attack_ms` 10–30, `release_ms`, `gain_reduction_db` ≤ 3 |
 | `dynamic_eq` | `freq_hz`, `threshold_db`, `ratio` |
@@ -60,6 +84,22 @@ expected_gain_reduction_db     = max(0, true_peak + input_gain_db - ceiling_dbtp
 * A negative `input_gain_db` is a pre-limiter trim: the peak exceeds the ceiling by more than
   the 4 dB GR budget. Beyond 4 dB GR + 3 dB trim, the recipe is a terminal `send_back`
   (`peak_beyond_limiter`).
+* The limiter action carries `expect: {"metric": "loudness.true_peak_dbtp", "max": ceiling}`.
+  That is what a post-bounce `verify_recipe` checks; it does not assume the predicted GR happened.
+
+## Verification
+
+`verify_recipe(recipe, before_path, after_path, before_stems?, after_stems?)` measures both
+masters (and the stems when supplied), then evaluates every `expect`. It returns one check per
+action id:
+
+```json
+{"id": "eq-bell:master:bass", "metric": "spectral.bands_db_rel.bass",
+ "before": -8.2, "after": -10.0, "measured_delta_db": -1.8, "status": "met"}
+```
+
+`all_met` is true only when every check is `met`; an `unmeasured` check makes it false. Validation
+still runs first, so a malformed recipe returns `valid: false` and no measurements.
 
 ## Adapter obligations
 
@@ -80,6 +120,16 @@ expected_gain_reduction_db     = max(0, true_peak + input_gain_db - ceiling_dbtp
    `input_gain_db`, `ceiling_dbtp` and GR prediction stay instructions for a human.
 7. `send_back` is terminal: nothing is applied and the reasons are surfaced.
 8. Missing live inventory is `needs_inventory`; the adapter never assumes an empty slot 0.
+9. Carry `id` and `expect` into the plan/report unchanged. The adapter does not edit the
+   expectation to match what it managed to apply; `verify_recipe` compares the original contract
+   with the post-bounce measurement.
+
+## Migration 2.1.0 → 2.2.0
+
+Actions gain an optional `expect` and a generated `id`. `expect` is required for a post-bounce
+check, but is optional in the schema so hand-written recipes remain valid. Update any pinned
+`schema` string to `2.2.0`; the adapter rejects a mismatch. The action vocabulary and the limiter
+control fields are unchanged.
 
 ## Migration 2.0.0 → 2.1.0
 

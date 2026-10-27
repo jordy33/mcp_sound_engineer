@@ -39,7 +39,7 @@ faders, pan and shelves are applied once, and the master EQ is never corrected.
 
 ## Contract
 
-The only coupling is `docs/RECIPE.md` (schema `2.1.0`). It is versioned; adapters declare which
+The only coupling is `docs/RECIPE.md` (schema `2.2.0`). It is versioned; adapters declare which
 version they can apply.
 
 ## Failure modes the adapter must handle

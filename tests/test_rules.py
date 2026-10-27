@@ -639,12 +639,64 @@ def test_mono_compatibility_warning():
 
 def test_mix_masking_clamp_is_reported_not_hidden():
     answers = _mix_answers(masking={"score": 10.0})
-    stems = ["01_vocals.wav"]
-    recipe = rules.build_mix_recipe(answers, stems)
+    stems = ["01_vocals.wav", "02_drums.wav"]
+    stem_facts = [
+        {"name": "01_vocals", "path": "/s/01_vocals.wav",
+         "bands_db_rel": {"sub": -40.0, "bass": -28.0, "low_mid": -14.0,
+                          "mid": -10.0, "high_mid": -18.0, "high": -28.0}},
+        {"name": "02_drums", "path": "/s/02_drums.wav",
+         "bands_db_rel": {"sub": -35.0, "bass": -20.0, "low_mid": -12.0,
+                          "mid": -9.0, "high_mid": -15.0, "high": -25.0}},
+    ]
+    recipe = rules.build_mix_recipe(answers, stems, stem_facts)
     bell = next(a for a in recipe if a["action"] == "eq.bell")
     assert bell["gain_db"] == -rules.GATE["max_corrective_db_per_point"], bell
-    warnings = rules.mix_warnings(answers, stems)
+    assert bell["freq_hz"] == rules.BAND_CENTERS["mid"], bell
+    assert bell["band"] == "mid" and bell["stems"] == ["01_vocals", "02_drums"], bell
+    warnings = rules.mix_warnings(answers, stems, stem_facts)
     assert any("capped" in w and "structural" in w for w in warnings), warnings
+
+
+def test_mix_masking_uses_the_measured_pair_and_band():
+    answers = _mix_answers(masking={"score": 4.0})
+    stem_facts = [
+        {"name": "01_vocals", "path": "/s/01_vocals.wav",
+         "bands_db_rel": {"sub": -40.0, "bass": -30.0, "low_mid": -20.0,
+                          "mid": -22.0, "high_mid": -8.0, "high": -20.0}},
+        {"name": "02_gtr", "path": "/s/02_gtr.wav",
+         "bands_db_rel": {"sub": -45.0, "bass": -35.0, "low_mid": -25.0,
+                          "mid": -26.0, "high_mid": -9.0, "high": -22.0}},
+    ]
+    bell = next(a for a in rules.build_mix_recipe(answers, [], stem_facts)
+                if a["action"] == "eq.bell")
+    assert bell["freq_hz"] == rules.BAND_CENTERS["high_mid"], bell
+    assert bell["band"] == "high_mid", bell
+    assert bell["reason"] == "measured_band_overlap", bell
+    assert bell["expect"]["metric"] == "spectral.bands_db_rel.high_mid", bell
+
+
+def test_mix_masking_never_invents_a_frequency_without_measurements():
+    answers = _mix_answers(masking={"score": 4.0})
+    recipe = rules.build_mix_recipe(answers, ["01_vocals.wav"])
+    assert not [a for a in recipe if a["action"] == "eq.bell"], recipe
+    warnings = rules.mix_warnings(answers, ["01_vocals.wav"])
+    assert any("no stem band data" in w for w in warnings), warnings
+
+
+def test_mix_masking_does_not_cut_the_bus_for_low_band_overlap():
+    answers = _mix_answers(masking={"score": 4.0})
+    stem_facts = [
+        {"name": "01_vocals", "path": "/s/01_vocals.wav",
+         "bands_db_rel": {"sub": -30.0, "bass": -8.0, "low_mid": -25.0,
+                          "mid": -40.0, "high_mid": -40.0, "high": -40.0}},
+        {"name": "02_bass", "path": "/s/02_bass.wav",
+         "bands_db_rel": {"sub": -25.0, "bass": -7.0, "low_mid": -28.0,
+                          "mid": -42.0, "high_mid": -42.0, "high": -42.0}},
+    ]
+    recipe = rules.build_mix_recipe(answers, [], stem_facts)
+    assert not [a for a in recipe if a["action"] == "eq.bell"], recipe
+    warnings = rules.mix_warnings(answers, [], stem_facts)
+    assert any("sub/bass only" in w for w in warnings), warnings
 
 
 def test_mix_masking_within_cap_is_not_warned():
@@ -707,6 +759,101 @@ def test_action_rejects_unknown_target():
         pass
     else:
         raise AssertionError("unknown target must not be coerced to master")
+
+
+# --- action ids, expectations and post-bounce verification -------------------
+def test_every_action_gets_a_unique_stable_id():
+    recipe = rules.build_master_recipe(_answers(low_end={"score": 3.0}),
+                                       _master_facts(), "spotify")
+    ids = [a.get("id") for a in recipe]
+    assert all(isinstance(i, str) and i for i in ids), recipe
+    assert len(ids) == len(set(ids)), ids
+    again = rules.build_master_recipe(_answers(low_end={"score": 3.0}),
+                                      _master_facts(), "spotify")
+    assert [a.get("id") for a in again] == ids
+
+
+def test_limiter_expect_is_the_true_peak_ceiling():
+    lim = _limiter(rules.build_master_recipe(_answers(), _master_facts(-18.0, -3.0),
+                                             "spotify"))
+    assert lim["expect"] == {"metric": "loudness.true_peak_dbtp", "max": -1.0,
+                             "tolerance_db": 0.1}, lim
+
+
+def test_corrective_expect_names_the_band_and_delta():
+    recipe = rules.build_master_recipe(
+        _answers(low_end={"score": 3.0}),
+        _master_facts(spectral={"bands_db_rel": {"sub": -50.0, "bass": 0.0,
+                                                 "low_mid": -45.0, "mid": -40.0,
+                                                 "high_mid": -45.0, "high": -50.0}}),
+        "spotify")
+    bell = next(a for a in recipe if a["action"] == "eq.bell")
+    assert bell["expect"]["metric"] == "spectral.bands_db_rel.bass", bell
+    assert bell["expect"]["delta_db"] == -2.0, bell
+
+
+def test_verify_expectations_reports_met_missed_and_unmeasured():
+    recipe = [
+        {"id": "bell", "action": "eq.bell", "expect": {
+            "metric": "spectral.bands_db_rel.mid", "delta_db": -2.0,
+            "tolerance_db": 0.5}},
+        {"id": "lim", "action": "limiter", "expect": {
+            "metric": "loudness.true_peak_dbtp", "max": -1.0, "tolerance_db": 0.0}},
+        {"id": "gone", "action": "eq.bell", "expect": {
+            "metric": "spectral.bands_db_rel.high", "delta_db": -1.0,
+            "tolerance_db": 0.5}},
+    ]
+    before = {"spectral": {"bands_db_rel": {"mid": -10.0}},
+              "loudness": {"true_peak_dbtp": -5.0}}
+    after = {"spectral": {"bands_db_rel": {"mid": -12.2}},
+             "loudness": {"true_peak_dbtp": -0.5}}
+    checks = {c["id"]: c for c in rules.verify_expectations(recipe, before, after)}
+    assert checks["bell"]["status"] == "met" and checks["bell"]["measured_delta_db"] == -2.2
+    assert checks["lim"]["status"] == "missed"
+    assert checks["gone"]["status"] == "unmeasured"
+
+
+def test_verify_expectations_resolves_stem_metrics():
+    recipe = [{"id": "fader", "action": "fader", "expect": {
+        "metric": "stem.integrated_lufs", "stem": "/s/01_vocals.wav",
+        "delta_db": -2.0, "tolerance_db": 0.5}}]
+    before = {"stems": []}
+    after = {"stems": []}
+    checks = rules.verify_expectations(
+        recipe, before, after,
+        stems_before={"01_vocals": {"integrated_lufs": -16.0}},
+        stems_after={"01_vocals": {"integrated_lufs": -18.3}})
+    assert checks[0]["status"] == "met", checks
+
+
+def test_validate_recipe_rejects_bad_ids_and_expectations():
+    base = {"action": "eq.bell", "target": "master",
+            "schema": rules.RECIPE_SCHEMA_VERSION, "freq_hz": 500,
+            "gain_db": -2.0, "q": 4.0}
+    bad = [
+        dict(base, id=""),
+        dict(base, id="same", expect={"metric": "x", "delta_db": 1.0}),
+        dict(base, id="same", expect={"metric": "x", "delta_db": 1.0}),
+        dict(base, id="no-comparator", expect={"metric": "x"}),
+        dict(base, id="bad-metric", expect={"metric": "", "delta_db": 1.0}),
+        dict(base, id="bad-value", expect={"metric": "x", "delta_db": "loud"}),
+        dict(base, id="stem-no-name", expect={"metric": "stem.integrated_lufs",
+                                              "delta_db": 1.0}),
+        dict(base, id="bad-tolerance", expect={"metric": "x", "delta_db": 1.0,
+                                               "tolerance_db": -1.0}),
+    ]
+    codes = {v["code"] for v in rules.validate_recipe(bad)}
+    assert {"action_id_invalid", "action_id_duplicate", "expect_comparator",
+            "expect_metric_invalid", "expect_value_invalid", "expect_stem_missing",
+            "expect_tolerance_invalid"} <= codes, codes
+
+
+def test_upward_expand_is_not_emitted_and_is_named():
+    answers = _answers(dynamics={"choice": "expand"})
+    recipe = rules.build_master_recipe(answers, _master_facts(), "spotify")
+    assert not [a for a in recipe if a.get("mode") == "upward_expand"], recipe
+    warnings = rules.master_warnings(answers)
+    assert any("upward expansion" in w for w in warnings), warnings
 
 
 if __name__ == "__main__":

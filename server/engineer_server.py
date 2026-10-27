@@ -20,7 +20,7 @@ except ImportError:  # executed as a script: python server/engineer_server.py
     from jev import ask, config
 
 SERVER_NAME = "mcp_sound_engineer"
-SERVER_VERSION = "0.7.0"
+SERVER_VERSION = "0.8.0"
 
 # Jev schemas live in rules.py: one source of truth for the answer keys.
 MASTER_QUESTIONS = rules.MASTER_QUESTIONS
@@ -68,12 +68,42 @@ def tool_validate_recipe(recipe: list) -> dict:
             "schema": rules.RECIPE_SCHEMA_VERSION}
 
 
+def _stem_fact_map(paths: list[str] | None) -> dict:
+    if not paths:
+        return {}
+    return {os.path.splitext(os.path.basename(stem["path"]))[0]: stem
+            for stem in analyze_stems(paths)["stems"]}
+
+
+def tool_verify_recipe(recipe: list, before_path: str, after_path: str,
+                       before_stems: list[str] | None = None,
+                       after_stems: list[str] | None = None) -> dict:
+    """Check the post-bounce measurements against each action's `expect`."""
+    violations = rules.validate_recipe(recipe)
+    if violations:
+        return {"valid": False, "violations": violations, "checks": [],
+                "met": 0, "missed": 0, "unmeasured": 0, "all_met": False}
+    before = analyze_master(before_path)
+    after = analyze_master(after_path)
+    checks = rules.verify_expectations(
+        recipe, before, after,
+        stems_before=_stem_fact_map(before_stems),
+        stems_after=_stem_fact_map(after_stems))
+    met = sum(1 for c in checks if c["status"] == "met")
+    missed = sum(1 for c in checks if c["status"] == "missed")
+    unmeasured = sum(1 for c in checks if c["status"] == "unmeasured")
+    return {"valid": True, "violations": [], "checks": checks,
+            "met": met, "missed": missed, "unmeasured": unmeasured,
+            "all_met": bool(checks) and met == len(checks)}
+
+
 def tool_judge_master(path: str, platform: str = "spotify",
                       reference_path: str | None = None,
                       previous_path: str | None = None,
                       desired_lufs: float | None = None) -> dict:
     facts = analyze_master(path)
     target = rules.loudness_target(platform)
+    reference_source = "measured" if reference_path else "generic_default"
     if reference_path:
         measured = analyze_reference(reference_path)
         reference_curve = measured["reference_curve"]
@@ -81,13 +111,19 @@ def tool_judge_master(path: str, platform: str = "spotify",
         measured, reference_curve = None, rules.REFERENCE_CURVE
     gates = rules.evaluate_gates(facts)
     warnings = rules.loudness_warnings(facts, target)
+    if reference_source == "generic_default":
+        warnings.append("no reference track was supplied: REFERENCE_CURVE is a generic "
+                        "fallback, not a genre target, so tonal moves are advisory "
+                        "(a bass-heavy genre can read as low-end excess). Pass "
+                        "reference_path for a genre-appropriate balance.")
     if gates["send_back"]:
         # Measured refusals must not depend on a network call or a key.
-        recipe = [rules._action("send_back", reasons=gates["reasons"])]
+        recipe = rules.finalize_recipe([rules._action("send_back", reasons=gates["reasons"])])
         warnings += rules.limiter_warnings(recipe)
         return {"facts": facts, "answers": {}, "gates": gates,
                 "recipe": recipe, "target": target, "reference": measured,
-                "reference_curve": reference_curve, "warnings": warnings}
+                "reference_curve": reference_curve, "reference_source": reference_source,
+                "warnings": warnings}
 
     state = {
         "context": {"stage": "mastering", "platform": platform,
@@ -97,8 +133,12 @@ def tool_judge_master(path: str, platform: str = "spotify",
                             "required to reach the normalization figure"},
         "facts": _jev_facts(facts),
         "reference_curve": reference_curve,
+        "reference_source": reference_source,
         "limits": rules.GATE,
     }
+    if reference_source == "generic_default":
+        state["reference_note"] = ("generic fallback, not genre-specific; treat tonal "
+                                   "excess as advisory")
     if measured is not None:
         state["reference_sibilance_db_rel"] = measured.get("sibilance_db_rel")
     answers = ask(state, MASTER_QUESTIONS)
@@ -106,6 +146,7 @@ def tool_judge_master(path: str, platform: str = "spotify",
     recipe = rules.build_master_recipe(answers, facts, platform,
                                        reference_curve=reference_curve,
                                        desired_lufs=desired_lufs)
+    warnings += rules.master_warnings(answers)
     warnings += rules.limiter_warnings(recipe)
     if confidence["needs_human"]:
         warnings.append(f"low confidence on {sorted(confidence['low'])}; treat the recipe as a draft")
@@ -122,6 +163,7 @@ def tool_judge_master(path: str, platform: str = "spotify",
             "target": target,
             "reference": measured,
             "reference_curve": reference_curve,
+            "reference_source": reference_source,
             "confidence": confidence,
             "warnings": warnings}
 
@@ -211,6 +253,21 @@ TOOLS = {
             "recipe": {"type": "array", "items": {"type": "object"}}}, "required": ["recipe"]},
         "handler": lambda a: tool_validate_recipe(a["recipe"]),
     },
+    "verify_recipe": {
+        "description": "Close the loop: compare before/after measurements against each action's "
+                       "expect. Missing metrics are unmeasured, never met. Pass stem lists when "
+                       "the recipe has stem expectations.",
+        "inputSchema": {"type": "object", "properties": {
+            "recipe": {"type": "array", "items": {"type": "object"}},
+            "before_path": {"type": "string"},
+            "after_path": {"type": "string"},
+            "before_stems": {"type": "array", "items": {"type": "string"}},
+            "after_stems": {"type": "array", "items": {"type": "string"}}},
+            "required": ["recipe", "before_path", "after_path"]},
+        "handler": lambda a: tool_verify_recipe(
+            a["recipe"], a["before_path"], a["after_path"],
+            a.get("before_stems"), a.get("after_stems")),
+    },
     "engineer_info": {
         "description": "Server status: rules version, Jev configuration, supported platforms.",
         "inputSchema": {"type": "object", "properties": {}},
@@ -235,13 +292,22 @@ def handle(msg: dict) -> dict | None:
         return make_error(None, -32600, "invalid request: expected a JSON object")
     method = msg.get("method")
     rid = msg.get("id")
+    # JSON-RPC: a request without an id is a notification, and a server MUST NOT
+    # reply to it — not even with an error. MCP's own `notifications/*` methods
+    # are always notifications, even if a client mistakenly supplies an id.
+    notification = "id" not in msg or (
+        isinstance(method, str) and method.startswith("notifications/"))
     if not isinstance(method, str):
-        return make_error(rid, -32600, "invalid request: method must be a string")
+        return None if notification else make_error(
+            rid, -32600, "invalid request: method must be a string")
     params = msg.get("params")
     if params is None:
         params = {}
     if not isinstance(params, dict):
-        return make_error(rid, -32602, "invalid params: expected a JSON object")
+        return None if notification else make_error(
+            rid, -32602, "invalid params: expected a JSON object")
+    if notification:
+        return None
     if method == "initialize":
         return make_result(rid, {
             "protocolVersion": params.get("protocolVersion", "2024-11-05"),

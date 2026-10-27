@@ -94,12 +94,13 @@ translation from recipe to calls is `adapter/`, a client of `mcp_logic`, not ano
 | Tool | Input | Returns |
 |---|---|---|
 | `analyze_master` | one stereo file | LUFS, true peak, LRA, crest, phase correlation, 6 bands, 5–9 kHz sibilance, centroid, clipping |
-| `analyze_stems` | N files | per-stem loudness, bands, sibilance, low-band correlation, pairwise band overlap (a spectral-crowding proxy, not perceptual masking), and stem gates (buried vocal, outlier element, mono bass) |
+| `analyze_stems` | N files | per-stem loudness, bands, sibilance, low-band correlation, pairwise band overlap with the dominant shared band (a spectral-crowding proxy, not perceptual masking), and stem gates (buried vocal, outlier element, mono bass) |
 | `analyze_sections` | path + window | per-window LUFS/bands/correlation and which windows deviate from the median |
 | `analyze_reference` | path | a commercial reference's band balance and sibilance, to feed `judge_master` |
-| `validate_recipe` | recipe | adapter-side contract check: caps, schema, limiter control fields, terminal `send_back` |
+| `validate_recipe` | recipe | adapter-side contract check: caps, schema, action ids, `expect` shape, limiter control fields, terminal `send_back` |
+| `verify_recipe` | recipe + before/after files (optional stem lists) | per-action `expect` results after a bounce: `met`, `missed` or `unmeasured` — never a claim the measurement did not support |
 | `judge_master` | path, platform, optional `reference_path` / `previous_path` / `desired_lufs` | `answers` + `recipe` + `warnings`; `desired_lufs` is an optional loudness request, not a delivery target (omit it for peak-only limiting); **measured gates run before the model**, so a refusal needs no key |
-| `judge_mix` | stem paths | `answers` + `recipe` |
+| `judge_mix` | stem paths | `answers` + `recipe`; the masking bell uses the measured overlap pair and band, not a fixed 300 Hz |
 | `engineer_info` | — | rules version, Jev status, platforms |
 
 ## 5. The rules, and where they live
@@ -120,7 +121,8 @@ one source of truth for both the numbers and the answer keys.
 | Already a finished master | LRA < 4 **and** TP > −1 **and** LUFS > −12 | `MAX_LRA_FINISHED` | **measured** → `send_back` (product rule) |
 | Corrective EQ per point | ≤ 3 dB | `GATE.max_corrective_db_per_point` | over the cap → `send_back`, never clamped |
 | Cumulative corrective EQ | ≤ 6 dB | `GATE.max_cumulative_corrective_db` | includes the sibilance cut |
-| Masking (mix) | score 2–10, cut starts above 2 | `MASKING_*`, `GATE.max_corrective_db_per_point` | bell capped at −3 dB; `mix_warnings` names the structural remainder instead of hiding it |
+| Masking (mix) | score 2–10, cut starts above 2 | `MASKING_*`, `GATE.max_corrective_db_per_point` | frequency and stem pair come from the measured dominant shared band; sub/bass-only overlap emits no bus bell; no measurement means no invented frequency; the bell is capped at −3 dB and `mix_warnings` names the structural remainder |
+| Upward expansion | not offered | `dynamics` choices / `master_warnings` | over-compressed material is an upstream problem; no action is emitted and the warning says so |
 | Total gain reduction | ≤ 6 dB (source range 6–8) | `GATE.max_total_gain_reduction_db` | compressor + limiter summing over budget → `send_back` |
 | Mono compatibility | fold-down loss < 6 dB | `GATE.min_mono_cancel_db` | warning with the measured loss |
 | Gain staging (mix) | every stem toward −18 LUFS | `GAIN_STAGING_*` | deterministic faders, ±6 dB max; a capped move or unmeasured loudness is warned |
@@ -134,7 +136,7 @@ one source of truth for both the numbers and the answer keys.
 | Dither | only when the destination needs fewer bits than the source | `PLATFORMS[...]`, `facts.bit_depth` | none for streaming; TPDF for CD/podcast only if reducing |
 | Playback normalization | Spotify −14, Apple −16, … | `PLATFORMS` | informational; never a delivery target |
 | Unknown destination | — | `loudness_target` | raises, no silent fallback |
-| Reference curve | measured from a real track when `reference_path` is given, normalized default otherwise | `analyze_reference`, `REFERENCE_CURVE` | linear sum = 1.0 for the default; a partial measured curve fails loud |
+| Reference curve | measured from a real track when `reference_path` is given, generic normalized default otherwise | `analyze_reference`, `REFERENCE_CURVE` | default six-band linear sum = 1.0; `judge_master` warns and reports `reference_source: "generic_default"` because a bass-heavy genre can read as excess; a partial measured curve fails loud |
 | Correlation drop after the chain | > 0.15 | `correlation_drop` | warning when `previous_path` is given; missing correlation on either side is reported unmeasured, not as a zero drop |
 | Sibilance | 5–9 kHz relative to full-band energy | `analysis.SIBILANCE_BAND` | measured as `spectral.sibilance_db_rel`; informs the question, not a de-esser threshold |
 | Noise floor | > −50 dB; minor between −60 and −50 | `GATE.noise_floor_moderate_db`, `GATE.noise_floor_minor_db` | **measured in silence only**; > −50 → `send_back`, > −60 → warning; `None` when the file has no gap |
@@ -148,7 +150,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 287 tests: smoke + rules + analysis + adapter + loop
+./start-sound-engineer-mcp.sh --test     # 302 tests: smoke + rules + analysis + adapter + loop
 ```
 
 `tests/test_rules.py` asserts behaviour, plus the limiter's two-constraint arithmetic:
@@ -185,16 +187,22 @@ When you change a rule, break it on purpose first. If the suite stays green, the
 ## 6. The recipe contract
 
 Recipes are ordered arrays of `action` primitives; no plugin, vendor or DAW name appears.
-Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `2.1.0`).
+Full schema: [`docs/RECIPE.md`](docs/RECIPE.md) (currently `2.2.0`).
 
 ```json
 [
-  {"action": "eq.high_pass", "target": "master", "schema": "2.1.0", "freq_hz": 25, "slope_db_oct": 12},
-  {"action": "eq.bell", "target": "master", "schema": "2.1.0", "freq_hz": 300, "gain_db": -2.0, "q": 5.0, "role": "corrective"},
-  {"action": "limiter", "target": "master", "schema": "2.1.0", "ceiling_dbtp": -1.0, "input_gain_db": 0.0, "expected_gain_reduction_db": 2.0},
-  {"action": "send_back", "target": "master", "schema": "2.1.0", "reasons": ["already_mastered:measured"]}
+  {"id": "eq-high-pass:master", "action": "eq.high_pass", "target": "master", "schema": "2.2.0", "freq_hz": 25, "slope_db_oct": 12},
+  {"id": "eq-bell:master:bass", "action": "eq.bell", "target": "master", "schema": "2.2.0", "freq_hz": 150, "gain_db": -2.0, "q": 4.0, "role": "corrective",
+   "expect": {"metric": "spectral.bands_db_rel.bass", "delta_db": -2.0, "tolerance_db": 1.5}},
+  {"id": "limiter:master", "action": "limiter", "target": "master", "schema": "2.2.0", "ceiling_dbtp": -1.0, "input_gain_db": 0.0, "expected_gain_reduction_db": 2.0,
+   "expect": {"metric": "loudness.true_peak_dbtp", "max": -1.0, "tolerance_db": 0.1}},
+  {"id": "send-back:master", "action": "send_back", "target": "master", "schema": "2.2.0", "reasons": ["already_mastered:measured"]}
 ]
 ```
+
+`expect` is the closing measurement, not a promise: `verify_recipe` compares before/after and
+returns `unmeasured` when the metric is absent. A post-bounce check can therefore fail honestly
+instead of assuming the action worked.
 
 ### Applying it: `adapter/`
 
