@@ -3,14 +3,19 @@
 An MCP server that **measures audio and decides like a mix/master engineer**, returning a
 DAW-neutral action plan.
 
-It does not control any DAW. It is one of two independent MCPs:
+It does not control any DAW. It measures and decides; a separate adapter applies the plan. That
+adapter is **code in this repository** ([`adapter/`](adapter/)), not an LLM improvising calls:
 
 ```
-┌───────────────────────┐   facts + answers + recipe   ┌──────────────────────┐
-│  mcp_sound_engineer   │ ───────────────────────────► │  adapter MCP (yours) │
-│  measure → judge      │        (neutral JSON)        │  applies the plan    │
-└───────────────────────┘                              └──────────────────────┘
-        numpy + Jev
+┌───────────────────────┐   facts + answers + recipe   ┌──────────────────────────┐
+│  mcp_sound_engineer   │ ───────────────────────────► │  adapter/ (this repo)    │
+│  measure → judge      │        (neutral JSON)        │  recipe → mcp_logic calls│
+└───────────────────────┘                              └────────────┬─────────────┘
+        numpy + Jev                                                │ JSON-RPC
+                                                     ┌─────────────▼─────────────┐
+                                                     │  mcp_logic (DAW MCP)      │
+                                                     │  Logic Pro                │
+                                                     └───────────────────────────┘
 ```
 
 Two hats: **mixing** (N stems: balance, masking, corrective EQ) and **mastering** (one stereo file:
@@ -75,7 +80,8 @@ cd mcp_sound_engineer
 | `./start-sound-engineer-mcp.sh --status` / `--stop` / `--restart` | Lifecycle via `.run/engineer.pid` |
 | `./start-sound-engineer-mcp.sh --test` | Offline smoke test; does not need `.env` |
 
-Register it in any MCP client, next to your DAW adapter — they are separate servers:
+Register it in any MCP client next to the DAW MCP (`mcp_logic`) — they are separate servers. The
+translation from recipe to calls is `adapter/`, a client of `mcp_logic`, not another server:
 
 ```json
 {"mcpServers": {
@@ -142,7 +148,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 275 tests: smoke + rules + analysis + adapter + loop
+./start-sound-engineer-mcp.sh --test     # 287 tests: smoke + rules + analysis + adapter + loop
 ```
 
 `tests/test_rules.py` asserts behaviour, plus the limiter's two-constraint arithmetic:
@@ -221,6 +227,13 @@ The Stereo Out strip has no Arrange index: it is addressed as `strip: "output"`,
 | `polarity.invert` | **manual** | Gain is insert-only; `phaseInvert` has no write/readback |
 | `de_esser`, `dither`, `stereo.width`, `dynamic_eq` | **manual** | no verified surface; the step carries the manual instruction |
 | `send_back` | **terminal** | nothing is applied |
+
+Unsupported actions are reported, never improvised. Every action in `rules.ACTIONS` has a declared
+capability (`ready`, `manual` or `terminal`); a `manual` step carries `apply_by: "human"` and the
+reason, emits **no** MCP call, and blocks the loop from claiming delivery (exit `2`). A new action
+defaults to `manual` until the table is updated and tested. The matrix is enforced by
+`tests/test_adapter.py::test_capability_matrix_is_honest` and
+`::test_manual_actions_emit_no_calls_and_explain_why`.
 
 Every plugin call carries `mode: duplicate_applyback` and `project_expected_path`;
 `insert_verified` also carries `expected_name`. Mixer calls are the two-field

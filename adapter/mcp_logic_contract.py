@@ -127,8 +127,9 @@ MANUAL_ACTIONS = frozenset({
 TERMINAL_ACTIONS = frozenset({"send_back"})
 
 MANUAL_REASONS = {
-    "limiter": ("Limiter is not in mcp_logic's insert allowlist and has no "
-                "verified-writable parameter"),
+    "limiter": ("Limiter is not in mcp_logic's insert allowlist (despite the "
+                "tool text naming it) and has no verified-writable parameter "
+                "(ceiling included)"),
     "compressor": ("Compressor verifies only threshold, limiter_on and auto_release; "
                    "ratio/attack/release have no verified readback"),
     "polarity.invert": ("Gain is insert-only; phaseInvert has no verified write "

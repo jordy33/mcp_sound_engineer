@@ -43,22 +43,25 @@ Addressing rules:
 
 ### Capability matrix
 
-| Action | Status | Emitted |
-|---|---|---|
-| `fader` | `needs_calibration` → `ready` | `set_volume` after measured taper calibration |
-| `pan` | `ready` | `set_pan` |
-| `eq.bell` | `ready` | Channel EQ insert (once per target) + `Frequency`/`Gain`/`Q` |
-| `eq.shelf` | `ready` | `Frequency`/`Gain` (+ `Q` when present) on Low/High Shelf, sign preserved |
-| `eq.high_pass`, `eq.high_pass_stem` | `manual` | nothing — Low Cut is observed-only |
-| `compressor` | `manual` | nothing — insert-only, no verified ratio/attack/release |
-| `limiter` | `manual` | nothing — not insertable and no verified-writable parameter |
-| `polarity.invert` | `manual` | nothing — Gain is insert-only; `phaseInvert` has no write/readback |
-| `de_esser`, `dither`, `stereo.width`, `dynamic_eq` | `manual` | nothing |
-| `send_back` | `terminal` | nothing |
+| Action | Status | `mcp_logic` call | Notes |
+|---|---|---|---|
+| `fader` | `needs_calibration` → `ready` | `logic_mixer.set_volume` | contract 0..1 with a measured taper, not dB |
+| `pan` | `ready` | `logic_mixer.set_pan` | |
+| `eq.bell` | `ready` | `logic_plugins.insert_verified` (Channel EQ) + `logic_plugins.set_eq_band_verified` ×3 | once per target; `Frequency`/Hz, `Gain`/dB, `Q`/Q |
+| `eq.shelf` | `ready` | insert + `set_eq_band_verified` ×2–3 | `Frequency`/`Gain` (+ `Q` when present) on Low/High Shelf; sign preserved |
+| `eq.high_pass`, `eq.high_pass_stem` | `manual` | none | Low Cut is observed-only; slope is a host popup |
+| `compressor` | `manual` | none | the insert is verified, but ratio/attack/release have no verified readback; threshold/`limiter_on`/`auto_release` alone are not the recipe |
+| `limiter` | `manual` | none | named in `insert_verified`'s tool text but excluded by the live `insertableAllowlist`; even if inserted, ceiling has no verified write |
+| `polarity.invert` | `manual` | none | Gain is insert-only; `phaseInvert` has no write/readback |
+| `de_esser`, `dither`, `stereo.width`, `dynamic_eq` | `manual` | none | no verified surface; dither is a bounce setting |
+| `send_back` | `terminal` | none | terminal recipe |
 
 `Q-Factor`, `outputCeiling`, `phaseInvert`, `ratio`, `attack` and `release` are forbidden emissions.
-The Limiter is not in the insert allowlist (the real allowlist is Gain, Channel EQ, Compressor), so
-inserting one “blind” is not an option either.
+
+A `manual` step is not a fallback an LLM may replace with a guessed call. `build_plan` emits it with
+`apply_by: "human"` and a `hint`, `apply_steps` sends only `ready` steps, and any action missing
+from this matrix defaults to `manual`. The loop reports pending manual work with exit `2` instead
+of claiming delivery.
 
 ## Honest Contract
 
