@@ -32,9 +32,14 @@ def _master_facts(lufs: float = -18.0, tp: float = -1.0, **extra):
     stereo.update(extra.pop("stereo", {}))
     clipping = {"count": 0, "flat_top_frames": 0}
     clipping.update(extra.pop("clipping", {}))
+    # Default fixture: every band sits 6 dB above the reference, so a corrective
+    # request has measured excess to act on. Tests that care override `spectral`.
+    spectral = {"bands_db_rel": {b: round(v + 6.0, 2)
+                                 for b, v in rules.REFERENCE_CURVE.items()}}
+    spectral.update(extra.pop("spectral", {}))
     base = {"loudness": {"integrated_lufs": lufs, "true_peak_dbtp": tp,
                          "loudness_range_lu": 9.0},
-            "stereo": stereo, "clipping": clipping,
+            "stereo": stereo, "clipping": clipping, "spectral": spectral,
             "noise": {"floor_dbfs": None},
             "bandwidth": {"lossy_suspected": False, "drop_db": 0.0},
             "duration_seconds": 60, "sample_rate": 44100}
@@ -188,6 +193,35 @@ def test_corrective_within_cap_is_applied():
     for a in bells:
         assert abs(a["gain_db"]) <= rules.GATE["max_corrective_db_per_point"]
         assert 4.0 <= a["q"] <= 8.0, a
+
+
+def test_corrective_without_measured_bands_is_unmeasured_not_healthy():
+    facts = _master_facts()
+    del facts["spectral"]
+    recipe = rules.build_master_recipe(_answers(low_end={"score": 3.0}), facts, "spotify")
+    assert recipe[0]["action"] == "send_back", recipe
+    assert "unmeasured:spectral.bands_db_rel" in recipe[0]["reasons"], recipe
+
+    partial = _master_facts()
+    del partial["spectral"]["bands_db_rel"]["bass"]
+    recipe = rules.build_master_recipe(_answers(low_end={"score": 3.0}), partial, "spotify")
+    assert recipe[0]["action"] == "send_back", recipe
+    assert "unmeasured:spectral.bands_db_rel" in recipe[0]["reasons"], recipe
+
+
+def test_measured_balance_can_veto_a_model_correction():
+    """The score cannot invent excess the bands do not show."""
+    at_reference = _master_facts(spectral={
+        "bands_db_rel": dict(rules.REFERENCE_CURVE)})
+    recipe = rules.build_master_recipe(_answers(low_end={"score": 8.0}), at_reference, "spotify")
+    assert not [a for a in recipe if a["action"] == "eq.bell"], recipe
+
+    # Positive but small measured excess caps the requested cut.
+    one_db_over = _master_facts(spectral={
+        "bands_db_rel": {b: round(v + 1.0, 2) for b, v in rules.REFERENCE_CURVE.items()}})
+    recipe = rules.build_master_recipe(_answers(low_end={"score": 8.0}), one_db_over, "spotify")
+    bell = next(a for a in recipe if a["action"] == "eq.bell")
+    assert bell["gain_db"] == -1.0, bell
 
 
 def test_corrective_beyond_cap_sends_back():
@@ -439,6 +473,41 @@ def test_recipe_never_reads_a_key_the_schema_lacks():
                 raise AssertionError(f"{builder.__name__} tolerated missing {key!r}")
 
 
+def test_every_question_key_is_consumed_by_its_builder():
+    """The reverse check: a question that is bought from Jev but never read is dead weight."""
+    seen: set[str] = set()
+    original_score, original_choice = rules._score, rules._choice
+
+    def spy_score(answers, name):
+        seen.add(name)
+        return original_score(answers, name)
+
+    def spy_choice(answers, name, default=""):
+        seen.add(name)
+        return original_choice(answers, name, default)
+
+    rules._score, rules._choice = spy_score, spy_choice
+    try:
+        master_answers = _answers(low_end={"score": 3.0}, high_mid={"score": 3.0},
+                                   dynamics={"choice": "glue"},
+                                   dynamics_amount={"score": 3.0},
+                                   sibilance={"choice": "deess"})
+        rules.build_master_recipe(master_answers, _master_facts())
+        assert seen <= set(rules.MASTER_QUESTIONS), seen - set(rules.MASTER_QUESTIONS)
+        assert seen == set(rules.MASTER_QUESTIONS), set(rules.MASTER_QUESTIONS) - seen
+
+        seen.clear()
+        mix_answers = _mix_answers(masking={"score": 3.5})
+        stems = [{"path": "/s/01_vocals.wav", "integrated_lufs": -18.0,
+                  "phase_correlation": 0.9, "low_correlation": 1.0,
+                  "low_instrument": False}]
+        rules.build_mix_recipe(mix_answers, [s["path"] for s in stems], stems)
+        assert seen <= set(rules.MIX_QUESTIONS), seen - set(rules.MIX_QUESTIONS)
+        assert seen == set(rules.MIX_QUESTIONS), set(rules.MIX_QUESTIONS) - seen
+    finally:
+        rules._score, rules._choice = original_score, original_choice
+
+
 def test_validate_recipe_catches_cap_violations():
     bad = [
         {"action": "eq.bell", "target": "master", "schema": rules.RECIPE_SCHEMA_VERSION,
@@ -611,7 +680,7 @@ def test_corrective_uses_the_measured_band():
 def test_corrective_uses_the_measured_reference_curve():
     master = {"sub": -40.0, "bass": -5.0, "low_mid": -7.0,
               "mid": -40.0, "high_mid": -40.0, "high": -40.0}
-    measured = {"sub": -20.0, "bass": -2.0, "low_mid": -13.0,
+    measured = {"sub": -20.0, "bass": -2.0, "low_mid": -10.0,
                 "mid": -10.0, "high_mid": -10.0, "high": -20.0}
     facts = _master_facts(spectral={"bands_db_rel": master})
     answers = _answers(low_end={"score": 3.0})
@@ -728,6 +797,20 @@ def test_gain_staging_moves_each_stem_toward_minus_18():
     moves = {a["stem"]: a["gain_db"] for a in recipe if a.get("reason") == "gain_staging"}
     assert moves["/s/01_vocals.wav"] == -6.0, moves
     assert moves["/s/02_bass.wav"] == 6.0, moves
+
+
+def test_missing_mix_correlation_is_not_treated_as_healthy():
+    """A missing correlation is unmeasured: no polarity/width move and a named warning."""
+    stems = [{"path": "/s/01_vocals.wav", "integrated_lufs": -18.0,
+              "low_instrument": False, "channel_layout": "stereo"},
+             {"path": "/s/02_bass.wav", "integrated_lufs": -18.0,
+              "low_instrument": True, "channel_layout": "stereo"}]
+    answers = _mix_answers(phase_before_eq={"choice": "polarity"})
+    recipe = rules.build_mix_recipe(answers, [s["path"] for s in stems], stems)
+    assert not [a for a in recipe if a["action"] in ("polarity.invert", "stereo.width")], recipe
+    warnings = rules.mix_warnings(answers, [s["path"] for s in stems], stems)
+    assert any("phase correlation was not measured" in w for w in warnings), warnings
+    assert any("low-band correlation was not measured" in w for w in warnings), warnings
 
 
 def test_polarity_comes_before_eq_for_a_cancelling_stem():

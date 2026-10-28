@@ -121,18 +121,18 @@ one source of truth for both the numbers and the answer keys.
 | Rule | Value | In code | Behaviour |
 |---|---|---|---|
 | Phase correlation | < +0.3 | `GATE.min_phase_correlation` | **measured** → `send_back` |
-| Missing gate input | any of phase, mono fold-down loss, clipping/flat-top count, duration, sample rate, LRA/TP/LUFS, bandwidth | `evaluate_gates` | **not measured** → `unmeasured:<field>` and `send_back`; no healthy defaults |
+| Missing gate input | any of phase, mono fold-down loss, clipping/flat-top count, duration, sample rate, LRA/TP/LUFS, bandwidth, or the measured bands behind a requested correction | `evaluate_gates`, `build_master_recipe` | **not measured** → `unmeasured:<field>` and `send_back`; no healthy defaults |
 | Clipping that blocks mastering | ≥ 500 frames **and** ≥ 0.01 % | `MIN_CLIPPED_*` | **measured** → `send_back`; uses the larger of hard-clip frames and flat-topped runs (a ceiling below full scale); `count` is stereo frames, so the denominator is duration × sample rate |
 | True peak above full scale | > 0 dBTP | `evaluate_gates` | **measured** → `send_back`; inter-sample peaks distort on lossy encodes and DACs |
 | Already a finished master | LRA < 4 **and** TP > −1 **and** LUFS > −12 | `MAX_LRA_FINISHED` | **measured** → `send_back` (product rule) |
-| Corrective EQ per point | score 2–10 maps to 0–4 dB; ≤ 3 dB applied | `GATE.max_corrective_db_per_point`, `map_score` | only the extreme score exceeds the cap → `send_back`, never clamped |
+| Corrective EQ per point | score 2–10 maps to 0–4 dB; ≤ 3 dB applied, bounded by the measured excess over the reference | `GATE.max_corrective_db_per_point`, `map_score` | only the extreme score exceeds the cap → `send_back`, never clamped; a band at or below the reference gets no bell, so the model cannot invent excess |
 | Cumulative corrective EQ | ≤ 6 dB | `GATE.max_cumulative_corrective_db` | includes the sibilance cut |
 | Masking (mix) | score 2–10 maps to a 0–3 dB cut, below 2.5 no cut | `MASKING_*`, `GATE.max_corrective_db_per_point`, `map_score` | frequency and stem pair come from the time-weighted co-activity pairs; stems that never sound together get no bell; sub/bass-only overlap emits no bus bell; no measurement means no invented frequency; `mix_warnings` names the structural remainder at the cap |
 | Upward expansion | not offered | `dynamics` choices / `master_warnings` | over-compressed material is an upstream problem; no action is emitted and the warning says so |
 | Total gain reduction | ≤ 6 dB (source range 6–8) | `GATE.max_total_gain_reduction_db` | compressor + limiter summing over budget → `send_back` |
 | Mono compatibility | fold-down loss < 6 dB | `GATE.min_mono_cancel_db` | **measured** → `send_back`; missing measurement is `unmeasured`, never a healthy 0 dB |
 | Gain staging (mix) | every stem toward −18 LUFS | `GAIN_STAGING_*` | deterministic faders, ±6 dB max; a capped move or unmeasured loudness is warned |
-| Phase before EQ (mix) | correlation < +0.3 | `phase_before_eq` | `polarity.invert` or `eq.high_pass_stem` |
+| Phase before EQ (mix) | correlation < +0.3 | `phase_before_eq` | `polarity.invert` or `eq.high_pass_stem`; a missing per-stem correlation is unmeasured → no move and a warning |
 | Confidence | < 0.5, or absent | `CONFIDENCE_MIN` | `confidence.low` / `confidence.unknown` + warning; a missing confidence is not assumed to be 1.0 and the recipe is a draft |
 | Broadband compression | 1.5–3:1, 10–30 ms, 1–3 dB GR | `CHAIN`, `GATE.min/max_gain_reduction_db` | emitted on the master bus |
 | Dynamics amount | abstract score 2–10 | `map_score` | linear 2→1 dB, 6→2 dB, 10→3 dB; outside the scale clamps, never interpreted as dB |
@@ -156,7 +156,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 337 tests: smoke + rules + jev + analysis + adapter + loop
+./start-sound-engineer-mcp.sh --test     # 342 tests: smoke + rules + jev + analysis + adapter + loop
 ```
 
 `tests/test_rules.py` asserts behaviour, plus the limiter's two-constraint arithmetic:

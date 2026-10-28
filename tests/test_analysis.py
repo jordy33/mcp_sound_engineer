@@ -43,7 +43,8 @@ def _wav24(samples: np.ndarray, sr: int = SR) -> str:
     return path
 
 
-def _wav_float(samples: np.ndarray, sr: int = SR, bits: int = 32) -> str:
+def _wav_float(samples: np.ndarray, sr: int = SR, bits: int = 32,
+               extensible: bool = False) -> str:
     """Write WAVE_FORMAT_IEEE_FLOAT, which `wave` cannot round-trip."""
     path = os.path.join(tempfile.mkdtemp(), "tf.wav")
     data = np.atleast_2d(samples.T).T if samples.ndim > 1 else samples.reshape(-1, 1)
@@ -51,13 +52,19 @@ def _wav_float(samples: np.ndarray, sr: int = SR, bits: int = 32) -> str:
     raw = data.astype(dtype).tobytes()
     channels = data.shape[1]
     block = channels * bits // 8
+    if extensible:
+        guid = struct.pack("<IHH", 3, 0, 0x0010) + b"\x80\x00\x00\xAA\x00\x38\x9B\x71"
+        fmt = struct.pack("<HHIIHH", 0xFFFE, channels, sr, sr * block, block, bits)
+        fmt += struct.pack("<HHI", 22, bits, 0) + guid       # cbSize, valid bits, mask
+    else:
+        fmt = struct.pack("<HHIIHH", 3, channels, sr, sr * block, block, bits)
     with open(path, "wb") as handle:
         handle.write(b"RIFF")
-        handle.write(struct.pack("<I", 36 + len(raw)))
+        handle.write(struct.pack("<I", 20 + len(fmt) + len(raw)))
         handle.write(b"WAVE")
         handle.write(b"fmt ")
-        handle.write(struct.pack("<IHHIIHH", 16, 3, channels, sr,
-                                 sr * block, block, bits))
+        handle.write(struct.pack("<I", len(fmt)))
+        handle.write(fmt)
         handle.write(b"data")
         handle.write(struct.pack("<I", len(raw)))
         handle.write(raw)
@@ -452,6 +459,13 @@ def test_float_wav_is_decoded_at_its_real_level():
         facts = analysis.analyze_master(_wav_float(tone, bits=bits))
         assert facts["bit_depth"] == bits, facts
         assert abs(facts["loudness"]["sample_peak_dbfs"] - (-6.02)) < 0.05, (bits, facts)
+
+
+def test_extensible_float_wav_is_decoded():
+    """WAVE_FORMAT_EXTENSIBLE + IEEE_FLOAT subtype is what many float bounces use."""
+    facts = analysis.analyze_master(_wav_float(_sine(1000, 0.5), bits=32, extensible=True))
+    assert facts["bit_depth"] == 32, facts
+    assert abs(facts["loudness"]["sample_peak_dbfs"] - (-6.02)) < 0.05, facts
 
 
 def test_non_finite_float_samples_are_refused_with_context():

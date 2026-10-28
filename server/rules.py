@@ -672,24 +672,38 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
         level = _score(answers, band)
         if level < 2.5:
             continue
-        measured = (facts.get("spectral") or {}).get("bands_db_rel") or {}
-        excess = {b: float(measured.get(b, reference[b])) - reference[b] for b in group}
+        # A requested correction needs the measured bands that justify it. A
+        # missing band is unmeasured, never a zero-excess band at the reference.
+        measured = (facts.get("spectral") or {}).get("bands_db_rel")
+        values = measured if isinstance(measured, dict) else {}
+        if any(_number(values.get(b)) is None for b in group):
+            return _finalize([_action("send_back", reasons=[
+                "unmeasured:spectral.bands_db_rel"])])
+        excess = {b: float(values[b]) - float(reference[b]) for b in group}
         worst = max(excess, key=excess.get)
+        measured_excess = excess[worst]
+        if measured_excess <= 0.0:
+            # The measurement wins: a model score cannot cut a band that is
+            # already at or below the reference. No excess, no bell.
+            continue
         freq = BAND_CENTERS[worst]
-        # The score is a 2-10 decision level, not dB: map it onto 0-4 dB. Score 8
+        # The score is a 2-10 decision level, not dB: map it onto 0-4 dB, and
+        # never ask for more cut than the measured excess it is fixing. Score 8
         # (heavy) asks for the 3 dB cap; score 10 (extreme) exceeds it -> send back.
-        needed = map_score(level, 0.0, 4.0)
+        needed = _round_db(min(map_score(level, 0.0, 4.0), measured_excess))
+        if needed <= 0.0:
+            continue
         if needed > GATE["max_corrective_db_per_point"]:
             return _finalize([_action("send_back",
-                                      reasons=[f"corrective_beyond_cap:{band}:{round(needed, 1)}dB"])])
+                                      reasons=[f"corrective_beyond_cap:{band}:{needed}dB"])])
         total += needed
         if total > GATE["max_cumulative_corrective_db"]:
             return _finalize([_action("send_back",
-                                      reasons=[f"corrective_beyond_cap:cumulative:{round(total, 1)}dB"])])
-        recipe.append(_action("eq.bell", freq_hz=freq, gain_db=-round(needed, 1), q=4.0,
+                                      reasons=[f"corrective_beyond_cap:cumulative:{_round_db(total)}dB"])])
+        recipe.append(_action("eq.bell", freq_hz=freq, gain_db=-needed, q=4.0,
                               role="corrective", measured_from=band, band=worst,
                               expect=_expect_delta(f"spectral.bands_db_rel.{worst}",
-                                                   -round(needed, 1), 1.5)))
+                                                   -needed, 1.5)))
 
     # Dynamics before sibilance: the de-esser belongs to the dynamic stage, after compression.
     if _choice(answers, "dynamics") == "glue":
@@ -960,6 +974,25 @@ def mix_warnings(answers: dict, stems: list[str],
         out.append(f"no exported stem matches {role!r}; the fader move was omitted "
                    f"(stems: {[s.split('/')[-1] for s in stems]})")
 
+    def _stem_label(stem: dict) -> str:
+        path = str(stem.get("path", ""))
+        return os.path.basename(path) or path or "unnamed stem"
+
+    # Missing correlation is unmeasured, not a healthy 1.0 that silently skips the move.
+    if _choice(answers, "phase_before_eq") == "polarity":
+        missing = [_stem_label(stem) for stem in stem_facts or []
+                   if _number(stem.get("phase_correlation")) is None]
+        if missing:
+            out.append(f"phase correlation was not measured for {missing}; no polarity "
+                       f"move was planned for those stems, so the decision is unverified")
+    missing_low = [_stem_label(stem) for stem in stem_facts or []
+                   if stem.get("low_instrument")
+                   and stem.get("channel_layout") in ("stereo", "5.1")
+                   and _number(stem.get("low_correlation")) is None]
+    if missing_low:
+        out.append(f"low-band correlation was not measured for {missing_low}; the "
+                   f"mono-bass check was skipped rather than assumed healthy")
+
     plan = _masking_plan(answers, stem_facts, overlap_pairs)
     if plan:
         if plan["cut_db"] >= GATE["max_corrective_db_per_point"]:
@@ -1048,10 +1081,12 @@ def build_mix_recipe(answers: dict, stems: list[str],
                                                        round(move, 1), 1.0,
                                                        stem=stem["path"])))
 
-    # Phase before EQ: a cancelling stem gets polarity, not a filter.
+    # Phase before EQ: a cancelling stem gets polarity, not a filter. A missing
+    # correlation is unmeasured, not a healthy 1.0 that silently skips the move.
     if _choice(answers, "phase_before_eq") == "polarity":
         for stem in stem_facts or []:
-            if float(stem.get("phase_correlation", 1.0)) < GATE["min_phase_correlation"]:
+            correlation = _number(stem.get("phase_correlation"))
+            if correlation is not None and correlation < GATE["min_phase_correlation"]:
                 recipe.append(_action("polarity.invert", target="stem", stem=stem["path"],
                                       reason="phase_correlation"))
 
@@ -1063,7 +1098,8 @@ def build_mix_recipe(answers: dict, stems: list[str],
                                       freq_hz=80, slope_db_oct=12))
 
     for stem in stem_facts or []:
-        if float(stem.get("low_correlation", 1.0)) < GATE["min_phase_correlation"]:
+        low = _number(stem.get("low_correlation"))
+        if low is not None and low < GATE["min_phase_correlation"]:
             recipe.append(_action("stereo.width", target="bus", mono_below_hz=120,
                                   stem=stem["path"], reason="mono bass"))
     if _choice(answers, "bus_comp") == "glue":
