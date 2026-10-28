@@ -37,21 +37,24 @@ implemented (`analyze_sections`, `analyze_reference`, `judge_master.previous_pat
 
 | Metric | Reality |
 |---|---|
-| `integrated_lufs` | `pyloudnorm` when installed; otherwise K-weighting with coefficients derived for the actual sample rate (44.1/48/96 kHz agree with `pyloudnorm` within ~0.2 LU) |
+| `integrated_lufs` | one deterministic implementation: BS.1770 K-weighting with coefficients derived for the actual sample rate (44.1/48/96 kHz agree with `pyloudnorm`/`ffmpeg ebur128` within ~0.2 LU). `pyloudnorm` is not used at runtime |
 | `true_peak_dbtp` | 4× polyphase FIR over the whole file, edges included (BS.1770 minimum). Dedicated meters use 8× — expect ±0.3 dB on normal material, more near Nyquist |
 | `loudness_range_lu` | EBU R128 / Tech 3342: K-weighted 3 s short-term loudness, −70 LUFS absolute gate, −20 LU relative gate, P95−P10. `null` when the file is shorter than 3 s |
-| `phase_correlation` | one number for the whole file; it does not localize |
-| `band_overlap_pairs` | average per-band minimum of relative band energy: a spectral-crowding proxy, not perceptual masking; `dominant_band` names the largest shared band |
-| masking bell | the cut frequency comes from the measured dominant shared band; sub/bass-only overlap emits no bus bell, and no measurement means no frequency is invented |
+| channel layouts | 1–2 channels use unit weights; 6 channels are assumed to be the standard WAV order FL/FR/FC/LFE/BL/BR (Ls/Rs at +1.5 dB, LFE excluded). WAV carries no layout metadata, and any other channel count raises instead of guessing |
+| clipping | `count` is stereo frames with `|x| ≥ 0.999`; `flat_top_frames` counts frames containing a run of ≥3 equal samples at `|x| ≥ 0.5`, so a ceiling below full scale is visible. Neither knows whether the flat top came from the source or the limiter |
+| `phase_correlation` | one number for the whole file; it does not localize. `mono_cancel_db` is the fold-down level change: 0 dB is mono-safe, negative is loss |
+| `band_overlap_pairs` | time-weighted mean per-band minimum of relative band energy, measured only in 1 s windows where both stems are active (RMS > stem max − 40 dB): a spectral-crowding proxy, not perceptual masking. Windows can miss very brief collisions, and stems with different sample rates or too short for a window report no overlap |
+| masking bell | the cut frequency comes from the measured co-activity pair and its dominant shared band; stems that never sound together get no bell; sub/bass-only overlap emits no bus bell, and no measurement means no frequency is invented |
 | noise floor | measurable **only inside a real gap**; returns `None` on continuous music |
-| lossy detection | a cliff test at 16 kHz; a 22 kHz cut on a 44.1 kHz file still looks "full band" |
-| stem gates | need named stems (`vocals`, `drums`, `bass`); an unnamed export cannot be role-matched |
+| lossy detection | an estimate from adjacent 1 kHz bands above 10 kHz over the whole-file PSD. It reports the lower edge of a >20 dB cliff up to Nyquist, so a 19 kHz cut is distinguishable from a 22 kHz one. Creative filtering or extreme noise can cause false positives; a gentle codec rolloff may not reach 20 dB and reports no cliff |
+| stem gates | need named stems (`vocals`, `drums`, `bass`); an unnamed export cannot be role-matched. Buried vocal and outlier element use sustained integrated LUFS, not transient peaks |
+| `analyze_sections` | deviation flags are **informational**: a chorus legitimately differs from the median, so a flag is not a gate. A final window shorter than the requested size is included when it lasts ≥5 s and marked `partial` |
 | reference curve | measured from the file when `reference_path` is given; a generic normalized **constant** otherwise, reported as `reference_source: "generic_default"` and warned about (a bass-heavy genre can read as low-end excess). The default is normalized over the six bands; `bands_db_rel` is relative to the full spectrum, so its six-band sum can be slightly below 0 when energy exists below 20 Hz or above 16 kHz. Renormalizing only shifts a curve by a constant, which cancels when the worst band is chosen |
 | upward expansion | not offered: it has no verified mapping, and an over-compressed master is an upstream problem; the recipe leaves dynamics unchanged and says so |
 | post-bounce expectations | `verify_recipe` can only check the metrics that exist (`bands_db_rel`, true peak, stem LUFS, …). Compressor ratio, polarity, dither and stereo width carry no `expect`, and a missing metric is `unmeasured`, never `met` |
 | sibilance | 5–9 kHz energy relative to full-band; a descriptor, **not** a de-esser threshold |
 | limiter gain reduction | a **prediction** from measured LUFS/true peak, not a measurement of the limited file; it assumes the peak lands on the ceiling, and the real GR depends on the material |
-| pre-limiter trim | up to 3 dB of input trim; beyond 4 dB GR + 3 dB trim (7 dB over the ceiling) the recipe is a terminal `send_back`, not a request to limit harder |
+| pre-limiter trim | the planner supports up to 3 dB of input trim, but `build_master_recipe` refuses any true peak above 0 dBTP first, so a normal recipe never asks the limiter to recover that much |
 
 ## It does not know the music
 

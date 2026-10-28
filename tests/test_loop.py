@@ -68,7 +68,7 @@ def _metrics(**overrides):
                      "sample_peak_dbfs": -1.2, "crest_db": 12.0,
                      "loudness_range_lu": 6.0},
         "clipping": {"count": 0},
-        "stereo": {"phase_correlation": 0.85, "mono_cancel_db": -20.0},
+        "stereo": {"phase_correlation": 0.85, "mono_cancel_db": -0.5},
         "spectral": {"sibilance_db_rel": -2.0, "bands_db_rel": {},
                      "centroid_hz": 1000.0},
         "noise": {"floor_dbfs": -80.0},

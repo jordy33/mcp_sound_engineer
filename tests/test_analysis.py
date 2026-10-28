@@ -4,6 +4,7 @@ Every test generates a signal whose correct value is known analytically, so a wr
 formula fails here instead of silently reaching a recipe.
 """
 import os
+import struct
 import sys
 import tempfile
 import wave
@@ -39,6 +40,27 @@ def _wav24(samples: np.ndarray, sr: int = SR) -> str:
     with wave.open(path, "wb") as w:
         w.setnchannels(data.shape[1]); w.setsampwidth(3); w.setframerate(sr)
         w.writeframes(raw)
+    return path
+
+
+def _wav_float(samples: np.ndarray, sr: int = SR, bits: int = 32) -> str:
+    """Write WAVE_FORMAT_IEEE_FLOAT, which `wave` cannot round-trip."""
+    path = os.path.join(tempfile.mkdtemp(), "tf.wav")
+    data = np.atleast_2d(samples.T).T if samples.ndim > 1 else samples.reshape(-1, 1)
+    dtype = {32: "<f4", 64: "<f8"}[bits]
+    raw = data.astype(dtype).tobytes()
+    channels = data.shape[1]
+    block = channels * bits // 8
+    with open(path, "wb") as handle:
+        handle.write(b"RIFF")
+        handle.write(struct.pack("<I", 36 + len(raw)))
+        handle.write(b"WAVE")
+        handle.write(b"fmt ")
+        handle.write(struct.pack("<IHHIIHH", 16, 3, channels, sr,
+                                 sr * block, block, bits))
+        handle.write(b"data")
+        handle.write(struct.pack("<I", len(raw)))
+        handle.write(raw)
     return path
 
 
@@ -418,6 +440,121 @@ def test_jev_facts_have_no_absolute_paths():
     safe_stems = engineer_server._jev_facts(stems)
     assert safe_stems["stems"][0]["path"] == "01_vocals.wav"
     assert "band_overlap_pairs" in stems and "masking_pairs" not in stems
+
+
+# ---------------------------------------------------------------------------
+# formats, channel layouts and measured edge cases
+# ---------------------------------------------------------------------------
+def test_float_wav_is_decoded_at_its_real_level():
+    """Decoding a float WAV as int32 turns a 0.5 tone into near-silence."""
+    tone = _sine(1000, 0.5)
+    for bits in (32, 64):
+        facts = analysis.analyze_master(_wav_float(tone, bits=bits))
+        assert facts["bit_depth"] == bits, facts
+        assert abs(facts["loudness"]["sample_peak_dbfs"] - (-6.02)) < 0.05, (bits, facts)
+
+
+def test_non_finite_float_samples_are_refused_with_context():
+    tone = _sine(1000, 0.5, seconds=1.0)
+    tone[100] = np.nan
+    path = _wav_float(tone)
+    try:
+        analysis.load(path)
+    except ValueError as exc:
+        assert path in str(exc) and "non-finite" in str(exc), str(exc)
+    else:
+        raise AssertionError("a NaN sample must not reach the metrics")
+
+
+def test_five_one_uses_surround_weights_and_excludes_lfe():
+    t = np.arange(SR * 4) / SR
+    tone = 0.1 * np.sqrt(2) * np.sin(2 * np.pi * 997 * t)
+    zeros = np.zeros_like(tone)
+    front = np.stack([tone, tone, tone, zeros, zeros, zeros], axis=1)
+    lfe_only = np.stack([zeros, zeros, zeros, tone, zeros, zeros], axis=1)
+    assert analysis.channel_layout(6) == "5.1"
+    # three unit-weight channels add power (+4.77 dB over one channel).
+    assert abs(analysis.integrated_lufs(front, SR) - (-15.23)) < 0.5
+    assert analysis.integrated_lufs(lfe_only, SR) <= -60.0
+
+
+def test_unsupported_channel_counts_are_refused():
+    for channels in (3, 4, 8):
+        try:
+            analysis.channel_layout(channels)
+        except ValueError as exc:
+            assert f"{channels} channels" in str(exc), str(exc)
+        else:
+            raise AssertionError(f"{channels} channels must be refused")
+    path = _wav(np.zeros((SR, 4)))
+    try:
+        analysis.load(path)
+    except ValueError as exc:
+        assert "4 channels" in str(exc), str(exc)
+    else:
+        raise AssertionError("a 4-channel WAV must be refused")
+
+
+def test_stereo_crest_uses_all_channel_energy():
+    """The old mono-RMS denominator read an anti-phase file as ~220 dB crest."""
+    tone = 0.5 * np.sin(2 * np.pi * 1000 * np.arange(SR * 3) / SR)
+    facts = analysis.analyze_master(_wav(np.stack([tone, -tone], axis=1)))
+    assert abs(facts["loudness"]["crest_db"] - 3.01) < 0.15, facts["loudness"]
+
+
+def test_stereo_spectrum_averages_power_not_the_fold_down():
+    """An anti-phase pair cancels in mono but has the same spectrum as one channel."""
+    tone = _sine(997, 0.2)
+    mono = analysis.bands_db_rel(tone, SR)
+    anti = analysis.bands_db_rel(np.stack([tone, -tone], axis=1), SR)
+    assert mono == anti, (mono, anti)
+
+
+def test_flat_top_at_minus_one_dbfs_is_not_sample_clipping():
+    """A ceiling below full scale has no 0.999 hits but still has flat tops."""
+    clipped = np.clip(1.2 * np.sin(2 * np.pi * 440 * np.arange(SR * 3) / SR),
+                      -0.891, 0.891)
+    facts = analysis.clipping(clipped)
+    assert facts["count"] == 0, facts
+    assert facts["flat_top_frames"] > 1000, facts
+
+
+def test_measured_cutoff_reports_the_edge_and_full_band_is_none():
+    rng = np.random.default_rng(7)
+    full = rng.normal(size=SR * 10)
+    spectrum = np.fft.rfft(full)
+    freqs = np.fft.rfftfreq(len(full), 1 / SR)
+    spectrum[freqs > 20000] = 0
+    cut = np.fft.irfft(spectrum, n=len(full))
+    measured = analysis.spectral_cutoff(cut, SR)
+    assert measured["cutoff_hz"] == 20000, measured
+    assert measured["lossy_suspected"] is True, measured
+    assert analysis.spectral_cutoff(full, SR)["cutoff_hz"] is None
+
+
+def test_partial_section_tail_is_included_and_marked():
+    signal = 0.2 * np.sin(2 * np.pi * 220 * np.arange(int(23 * SR)) / SR)
+    facts = analysis.analyze_sections(_wav(signal), window_s=6.0)
+    last = facts["windows"][-1]
+    assert last["partial"] is True and last["duration_s"] == 5.0, last
+    assert facts["tail_dropped_s"] == 0.0, facts
+
+
+def test_temporal_overlap_separates_never_from_always_coactive():
+    t = np.arange(SR * 6) / SR
+    tone = 0.4 * np.sin(2 * np.pi * 500 * t)
+    never = analysis.analyze_stems([
+        _wav(np.where((t >= 0) & (t < 2), tone, 0.0)),
+        _wav(np.where((t >= 4) & (t < 6), tone, 0.0)),
+    ])["band_overlap_pairs"][0]
+    always = analysis.analyze_stems([_wav(tone), _wav(tone)])["band_overlap_pairs"][0]
+    assert never["band_overlap_db"] is None and never["coactive_fraction"] == 0.0, never
+    assert always["coactive_fraction"] > 0.9 and always["dominant_band"] == "mid", always
+
+
+def test_reference_measurement_is_idempotent():
+    path = _wav(0.2 * np.sin(2 * np.pi * 500 * np.arange(SR * 5) / SR))
+    assert analysis.analyze_reference(path) == analysis.analyze_reference(path)
 
 
 if __name__ == "__main__":

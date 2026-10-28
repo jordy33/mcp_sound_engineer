@@ -15,7 +15,7 @@ import math
 import os
 import re
 
-RULES_VERSION = "2.2.0"
+RULES_VERSION = "2.3.0"
 RECIPE_SCHEMA_VERSION = "2.2.0"
 
 # --- Gates: when to refuse to master a mix -----------------------------------
@@ -205,14 +205,43 @@ FIELD = {"noul": "noul", "score": "score", "choice": "choice"}
 
 
 def require(answers: dict, questions: dict) -> None:
-    """Fail loud when an answer is missing, or present without the field its type needs."""
+    """Fail loud on a missing answer or a value outside its declared domain.
+
+    A model answer is untrusted input: a score outside the 2-10 scale, a choice
+    that is not one of the criteria, or a probability outside 0-1 must never be
+    coerced into a plausible-looking recipe.
+    """
+    if not isinstance(answers, dict):
+        raise ValueError(f"answers must be an object, got {type(answers).__name__}")
     missing = [k for k in questions if k not in answers]
     if missing:
         raise ValueError(f"answers missing {missing}; schema defines {sorted(questions)}")
     malformed = [f"{k}.{FIELD[q['type']]}" for k, q in questions.items()
-                 if FIELD[q["type"]] not in answers[k]]
+                 if not isinstance(answers[k], dict) or FIELD[q["type"]] not in answers[k]]
     if malformed:
         raise ValueError(f"answers without the expected field: {malformed}")
+    for name, question in questions.items():
+        answer = answers[name]
+        kind = question["type"]
+        if kind == "score":
+            score = _number(answer.get("score"))
+            if score is None or not (SCORE_MIN <= score <= SCORE_MAX):
+                raise ValueError(f"{name}.score must be a finite number in "
+                                 f"[{SCORE_MIN}, {SCORE_MAX}], got {answer.get('score')!r}")
+        elif kind == "choice":
+            criteria = question.get("criteria") or {}
+            if answer.get("choice") not in criteria:
+                raise ValueError(f"{name}.choice must be one of {sorted(criteria)}, "
+                                 f"got {answer.get('choice')!r}")
+    for name, answer in answers.items():
+        # `noul` and `confidence` ride alongside the typed answer; validate them
+        # whenever they are present, but do not require them.
+        for field in ("noul", "confidence"):
+            if field in answer:
+                value = _number(answer[field])
+                if value is None or not (0.0 <= value <= 1.0):
+                    raise ValueError(f"{name}.{field} must be a number in [0, 1], "
+                                     f"got {answer[field]!r}")
 
 
 def _number(value):
@@ -296,13 +325,62 @@ def _stem_name(stem: dict) -> str:
         os.path.basename(str(stem.get("path", ""))))[0])
 
 
-def _band_overlap_plan(stem_facts: list[dict] | None) -> dict:
+def _temporal_overlap_plan(overlap_pairs: list[dict]) -> dict | None:
+    """Best masking target among measured co-activity pairs, or None if unusable.
+
+    Returns None when the list carries no measured pair at all, so the caller can
+    fall back to the static band minimum. A list whose measured pairs only collide
+    in sub/bass returns `low_band_only`.
+    """
+    measured = False
+    best = None
+    for pair in overlap_pairs:
+        if not isinstance(pair, dict) or pair.get("band_overlap_db") is None:
+            continue
+        measured = True
+        band = pair.get("dominant_band")
+        overlap = _number(pair.get("dominant_band_overlap_db"))
+        if overlap is None:
+            overlap = _number(pair.get("band_overlap_db"))
+        if band not in MASKING_BANDS or overlap is None:
+            continue
+        if overlap < MASKING_MIN_BAND_DB:
+            continue
+        if best is None or overlap > best["overlap_db"]:
+            best = {"status": "measured", "band": band,
+                    "freq_hz": BAND_CENTERS[band],
+                    "stems": [str(pair.get("a", "")), str(pair.get("b", ""))],
+                    "overlap_db": round(overlap, 1)}
+    if best is not None:
+        return best
+    if measured:
+        return {"status": "low_band_only", "band": None, "freq_hz": None,
+                "stems": [], "overlap_db": None}
+    return None
+
+
+def _band_overlap_plan(stem_facts: list[dict] | None,
+                       overlap_pairs: list[dict] | None = None) -> dict:
     """Pick the pair and frequency a masking bell should act on.
 
     The score says *how much* masking, but only the measured stems say *where*.
+    Co-activity pairs from `analyze_stems` are preferred: the static band minimum
+    claims a collision even between stems that never sound together. Without
+    measured pairs, the static minimum stays as the fallback for callers that
+    only pass per-stem band facts.
+
     Low-band overlap is deliberately excluded: a bus bell at 150 Hz would take
     weight out of the whole mix, while the actual fix is a fader or high-pass.
     """
+    if overlap_pairs is not None:
+        # A supplied pair list is authoritative: "they never sound together" is
+        # a measurement, and falling back to the static minimum would invent a
+        # collision the time-domain analysis just ruled out.
+        plan = _temporal_overlap_plan(overlap_pairs)
+        if plan is not None:
+            return plan
+        return {"status": "unmeasured", "band": None, "freq_hz": None,
+                "stems": [], "overlap_db": None}
     measured = False
     best = None
     facts = [s for s in stem_facts or [] if isinstance(s, dict)]
@@ -334,21 +412,20 @@ def _band_overlap_plan(stem_facts: list[dict] | None) -> dict:
             "band": None, "freq_hz": None, "stems": [], "overlap_db": None}
 
 
-def _masking_plan(answers: dict, stem_facts: list[dict] | None) -> dict | None:
+def _masking_plan(answers: dict, stem_facts: list[dict] | None,
+                  overlap_pairs: list[dict] | None = None) -> dict | None:
     score = _score(answers, "masking")
     if score < MASKING_SCORE_THRESHOLD:
         return None
-    plan = _band_overlap_plan(stem_facts)
+    plan = _band_overlap_plan(stem_facts, overlap_pairs)
     plan["score"] = score
-    plan["cut_db"] = _round_db(clamp(score - MASKING_SCORE_BASE, 0.0,
-                                     GATE["max_corrective_db_per_point"]))
+    plan["cut_db"] = _round_db(map_score(score, 0.0, GATE["max_corrective_db_per_point"]))
     return plan
 
 
 # --------------------------------------------------------------------------
 # Gates
 # --------------------------------------------------------------------------
-GATE_THRESHOLD = 0.8
 MIN_CLIPPED_SAMPLES = 500
 MIN_CLIPPED_PROPORTION = 0.0001
 MAX_LRA_FINISHED = 4.0
@@ -377,6 +454,13 @@ def evaluate_gates(facts: dict) -> dict:
         unmeasured.append("stereo.phase_correlation")
     elif phase < GATE["min_phase_correlation"]:
         reasons.append("phase_problem:measured")
+    # A mono fold-down that loses this much means real phase cancellation, not
+    # just a narrow image. Missing is unmeasured, never a healthy 0 dB.
+    cancel = _number(stereo.get("mono_cancel_db"))
+    if cancel is None:
+        unmeasured.append("stereo.mono_cancel_db")
+    elif cancel < GATE["min_mono_cancel_db"]:
+        reasons.append("mono_cancel:measured")
 
     loud = facts.get("loudness")
     loud = loud if isinstance(loud, dict) else {}
@@ -384,19 +468,26 @@ def evaluate_gates(facts: dict) -> dict:
     clipping = clipping if isinstance(clipping, dict) else {}
     # `count` is stereo FRAMES, not channel samples: analysis.clipping counts a
     # frame once even when both channels clip, so duration * sample_rate is the
-    # correct denominator regardless of channel count.
+    # correct denominator regardless of channel count. `flat_top_frames` catches
+    # a ceiling below full scale that `|x| >= 0.999` never sees.
     clipped = _count(clipping.get("count"))
+    flat_top = _count(clipping.get("flat_top_frames"))
     duration = _number(facts.get("duration_seconds"))
     sample_rate = _number(facts.get("sample_rate"))
     if clipped is None:
         unmeasured.append("clipping.count")
+    if flat_top is None:
+        unmeasured.append("clipping.flat_top_frames")
     if duration is None or duration <= 0:
         unmeasured.append("duration_seconds")
     if sample_rate is None or sample_rate <= 0:
         unmeasured.append("sample_rate")
-    if clipped is not None and duration and sample_rate:
+    worst_clipping = max((value for value in (clipped, flat_top) if value is not None),
+                         default=None)
+    if worst_clipping is not None and duration and sample_rate:
         frames = duration * sample_rate
-        if clipped >= MIN_CLIPPED_SAMPLES and (clipped / frames) >= MIN_CLIPPED_PROPORTION:
+        if (worst_clipping >= MIN_CLIPPED_SAMPLES
+                and (worst_clipping / frames) >= MIN_CLIPPED_PROPORTION):
             reasons.append("clipped:measured")
 
     noise = facts.get("noise")
@@ -435,6 +526,9 @@ def evaluate_gates(facts: dict) -> dict:
     if (lra is not None and true_peak is not None and integrated is not None
             and lra < MAX_LRA_FINISHED and true_peak > -1.0 and integrated > -12.0):
         reasons.append("already_mastered:measured")
+    # Inter-sample peaks above full scale distort on every lossy encode and DAC.
+    if true_peak is not None and true_peak > 0.0:
+        reasons.append("true_peak_over_zero:measured")
 
     reasons.extend("unmeasured:" + field for field in unmeasured)
     return {"send_back": bool(reasons), "reasons": reasons,
@@ -582,7 +676,9 @@ def build_master_recipe(answers: dict, facts: dict, platform: str = "spotify",
         excess = {b: float(measured.get(b, reference[b])) - reference[b] for b in group}
         worst = max(excess, key=excess.get)
         freq = BAND_CENTERS[worst]
-        needed = (level - 2.0) * 2.0   # level 4 (extreme) demands 4 dB -> send back
+        # The score is a 2-10 decision level, not dB: map it onto 0-4 dB. Score 8
+        # (heavy) asks for the 3 dB cap; score 10 (extreme) exceeds it -> send back.
+        needed = map_score(level, 0.0, 4.0)
         if needed > GATE["max_corrective_db_per_point"]:
             return _finalize([_action("send_back",
                                       reasons=[f"corrective_beyond_cap:{band}:{round(needed, 1)}dB"])])
@@ -834,15 +930,27 @@ def validate_recipe(recipe: list) -> list[dict]:
 
 
 def confidence_report(answers: dict, threshold: float = CONFIDENCE_MIN) -> dict:
-    """Surface model answers that are close to a coin flip."""
-    low = {name: round(float(answer.get("confidence", 1.0)), 2)
-           for name, answer in answers.items()
-           if float(answer.get("confidence", 1.0)) < threshold}
-    return {"threshold": threshold, "low": low, "needs_human": bool(low)}
+    """Surface model answers that are close to a coin flip or carry no confidence.
+
+    Missing confidence is `unknown`, not a confident 1.0: assuming certainty is
+    exactly the failure this report exists to prevent.
+    """
+    low: dict[str, float] = {}
+    unknown: list[str] = []
+    for name, answer in answers.items():
+        value = _number(answer.get("confidence")) if isinstance(answer, dict) else None
+        if value is None:
+            unknown.append(name)
+        elif value < threshold:
+            low[name] = round(value, 2)
+    return {"threshold": threshold, "low": low, "unknown": unknown,
+            "needs_human": bool(low or unknown)}
 
 
 def mix_warnings(answers: dict, stems: list[str],
-                 stem_facts: list[dict] | None = None) -> list[str]:
+                 stem_facts: list[dict] | None = None,
+                 overlap_pairs: list[dict] | None = None,
+                 gates: list[dict] | None = None) -> list[str]:
     """Say out loud when a decision cannot be applied to the exported files."""
     out: list[str] = []
     balance = _choice(answers, "balance")
@@ -852,16 +960,14 @@ def mix_warnings(answers: dict, stems: list[str],
         out.append(f"no exported stem matches {role!r}; the fader move was omitted "
                    f"(stems: {[s.split('/')[-1] for s in stems]})")
 
-    plan = _masking_plan(answers, stem_facts)
+    plan = _masking_plan(answers, stem_facts, overlap_pairs)
     if plan:
-        requested = plan["score"] - MASKING_SCORE_BASE
-        if requested > GATE["max_corrective_db_per_point"]:
+        if plan["cut_db"] >= GATE["max_corrective_db_per_point"]:
             where = (f"at {plan['freq_hz']} Hz" if plan["freq_hz"]
                      else "(frequency unmeasured)")
-            out.append(f"masking score {plan['score']:g} asks for {round(requested, 1)} dB "
-                       f"{where}, above the {GATE['max_corrective_db_per_point']} dB "
-                       f"corrective cap; the bell is capped and the remaining imbalance is "
-                       f"structural, not EQ-shaped")
+            out.append(f"masking score {plan['score']:g} is capped at the "
+                       f"{GATE['max_corrective_db_per_point']} dB corrective limit "
+                       f"{where}; the remaining imbalance is structural, not EQ-shaped")
         if plan["status"] == "unmeasured":
             out.append("masking was scored but no stem band data was measured; no bell was "
                        "emitted rather than guessing a frequency")
@@ -881,10 +987,26 @@ def mix_warnings(answers: dict, stems: list[str],
             out.append(f"{name} needs {round(needed, 1):+g} dB to reach "
                        f"{GAIN_STAGING_TARGET_LUFS} LUFS; the fader is capped at "
                        f"±{GAIN_STAGING_MAX_MOVE_DB} dB — check the gain structure upstream")
+    for gate in gates or []:
+        if not isinstance(gate, dict):
+            continue
+        name = gate.get("gate")
+        if name == "vocal_buried":
+            relative = _number(gate.get("relative_db"))
+            loss = f"{abs(relative):g} LU" if relative is not None else "too many LU"
+            out.append(f"the vocal stems sit {loss} below the rest of the mix; raise the "
+                       f"vocal bus or lower the competing element — no EQ bell was planned")
+        elif name == "single_element_peak":
+            excess = _number(gate.get("excess_db"))
+            over = f"{excess:g} LU" if excess is not None else "much"
+            out.append(f"{gate.get('stem')} sits {over} above the median stem; lower or "
+                       f"automate that element instead of compressing the whole mix")
     return out
 
 
-def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | None = None) -> list[dict]:
+def build_mix_recipe(answers: dict, stems: list[str],
+                     stem_facts: list[dict] | None = None,
+                     overlap_pairs: list[dict] | None = None) -> list[dict]:
     """Mix decisions. PRODUCT DEFAULTS: not sourced from the mastering methodology."""
     require(answers, MIX_QUESTIONS)
     recipe: list[dict] = []
@@ -901,7 +1023,7 @@ def build_mix_recipe(answers: dict, stems: list[str], stem_facts: list[dict] | N
             recipe.append(_action("fader", target=target, gain_db=move, stem=stem,
                                   expect=_expect_delta("stem.integrated_lufs", move,
                                                        1.0, stem=stem)))
-    plan = _masking_plan(answers, stem_facts)
+    plan = _masking_plan(answers, stem_facts, overlap_pairs)
     if plan and plan["status"] == "measured":
         # Over-cap requests are capped, and mix_warnings names the cap so the
         # hidden imbalance is not silently presented as an EQ-shaped problem.

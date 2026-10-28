@@ -52,9 +52,14 @@ calibrated probabilities instead of prose — that is why the output is machine-
 3. Put it in `.env`:
 
 ```bash
+# required: the key from step 2
 JEV_API_KEY=apikey_...
-JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone   # optional
-JEV_MODEL=jev-latest                                # optional
+
+# optional: override the endpoint chosen from the key prefix
+JEV_ENDPOINT=https://api.typesafe.ai/v1/systemone
+
+# optional: model id
+JEV_MODEL=jev-latest
 ```
 
 `.env` is git-ignored. The server re-reads it on every decision, so you can rotate the key without
@@ -93,9 +98,9 @@ translation from recipe to calls is `adapter/`, a client of `mcp_logic`, not ano
 
 | Tool | Input | Returns |
 |---|---|---|
-| `analyze_master` | one stereo file | LUFS, true peak, LRA, crest, phase correlation, 6 bands, 5–9 kHz sibilance, centroid, clipping |
-| `analyze_stems` | N files | per-stem loudness, bands, sibilance, low-band correlation, pairwise band overlap with the dominant shared band (a spectral-crowding proxy, not perceptual masking), and stem gates (buried vocal, outlier element, mono bass) |
-| `analyze_sections` | path + window | per-window LUFS/bands/correlation and which windows deviate from the median |
+| `analyze_master` | one stereo file | LUFS, true peak, LRA, crest, phase correlation, mono fold-down loss, 6 bands, sibilance, centroid, measured lossy cutoff, clipping and flat-topped frames; mono/stereo/5.1 layouts |
+| `analyze_stems` | N files | per-stem loudness, peak, bands, sibilance, low-band correlation, time-weighted pairwise overlap while both stems are active (a spectral-crowding proxy, not perceptual masking), and stem gates (buried vocal, outlier element, mono bass) |
+| `analyze_sections` | path + window | per-window LUFS/bands/correlation, deviation from the median (informational), and a partial final window when the tail is ≥5 s |
 | `analyze_reference` | path | a commercial reference's band balance and sibilance, to feed `judge_master` |
 | `validate_recipe` | recipe | adapter-side contract check: caps, schema, action ids, `expect` shape, limiter control fields, terminal `send_back` |
 | `verify_recipe` | recipe + before/after files (optional stem lists) | per-action `expect` results after a bounce: `met`, `missed` or `unmeasured` — never a claim the measurement did not support |
@@ -116,18 +121,19 @@ one source of truth for both the numbers and the answer keys.
 | Rule | Value | In code | Behaviour |
 |---|---|---|---|
 | Phase correlation | < +0.3 | `GATE.min_phase_correlation` | **measured** → `send_back` |
-| Missing gate input | any of phase, clipping count/duration/sample rate, LRA/TP/LUFS, bandwidth | `evaluate_gates` | **not measured** → `unmeasured:<field>` and `send_back`; no healthy defaults |
-| Clipping that blocks mastering | ≥ 500 frames **and** ≥ 0.01 % | `MIN_CLIPPED_*` | **measured** → `send_back`; `count` is stereo frames, so the denominator is duration × sample rate |
+| Missing gate input | any of phase, mono fold-down loss, clipping/flat-top count, duration, sample rate, LRA/TP/LUFS, bandwidth | `evaluate_gates` | **not measured** → `unmeasured:<field>` and `send_back`; no healthy defaults |
+| Clipping that blocks mastering | ≥ 500 frames **and** ≥ 0.01 % | `MIN_CLIPPED_*` | **measured** → `send_back`; uses the larger of hard-clip frames and flat-topped runs (a ceiling below full scale); `count` is stereo frames, so the denominator is duration × sample rate |
+| True peak above full scale | > 0 dBTP | `evaluate_gates` | **measured** → `send_back`; inter-sample peaks distort on lossy encodes and DACs |
 | Already a finished master | LRA < 4 **and** TP > −1 **and** LUFS > −12 | `MAX_LRA_FINISHED` | **measured** → `send_back` (product rule) |
-| Corrective EQ per point | ≤ 3 dB | `GATE.max_corrective_db_per_point` | over the cap → `send_back`, never clamped |
+| Corrective EQ per point | score 2–10 maps to 0–4 dB; ≤ 3 dB applied | `GATE.max_corrective_db_per_point`, `map_score` | only the extreme score exceeds the cap → `send_back`, never clamped |
 | Cumulative corrective EQ | ≤ 6 dB | `GATE.max_cumulative_corrective_db` | includes the sibilance cut |
-| Masking (mix) | score 2–10, cut starts above 2 | `MASKING_*`, `GATE.max_corrective_db_per_point` | frequency and stem pair come from the measured dominant shared band; sub/bass-only overlap emits no bus bell; no measurement means no invented frequency; the bell is capped at −3 dB and `mix_warnings` names the structural remainder |
+| Masking (mix) | score 2–10 maps to a 0–3 dB cut, below 2.5 no cut | `MASKING_*`, `GATE.max_corrective_db_per_point`, `map_score` | frequency and stem pair come from the time-weighted co-activity pairs; stems that never sound together get no bell; sub/bass-only overlap emits no bus bell; no measurement means no invented frequency; `mix_warnings` names the structural remainder at the cap |
 | Upward expansion | not offered | `dynamics` choices / `master_warnings` | over-compressed material is an upstream problem; no action is emitted and the warning says so |
 | Total gain reduction | ≤ 6 dB (source range 6–8) | `GATE.max_total_gain_reduction_db` | compressor + limiter summing over budget → `send_back` |
-| Mono compatibility | fold-down loss < 6 dB | `GATE.min_mono_cancel_db` | warning with the measured loss |
+| Mono compatibility | fold-down loss < 6 dB | `GATE.min_mono_cancel_db` | **measured** → `send_back`; missing measurement is `unmeasured`, never a healthy 0 dB |
 | Gain staging (mix) | every stem toward −18 LUFS | `GAIN_STAGING_*` | deterministic faders, ±6 dB max; a capped move or unmeasured loudness is warned |
 | Phase before EQ (mix) | correlation < +0.3 | `phase_before_eq` | `polarity.invert` or `eq.high_pass_stem` |
-| Confidence | < 0.5 | `CONFIDENCE_MIN` | `confidence.needs_human` + warning; the recipe is a draft |
+| Confidence | < 0.5, or absent | `CONFIDENCE_MIN` | `confidence.low` / `confidence.unknown` + warning; a missing confidence is not assumed to be 1.0 and the recipe is a draft |
 | Broadband compression | 1.5–3:1, 10–30 ms, 1–3 dB GR | `CHAIN`, `GATE.min/max_gain_reduction_db` | emitted on the master bus |
 | Dynamics amount | abstract score 2–10 | `map_score` | linear 2→1 dB, 6→2 dB, 10→3 dB; outside the scale clamps, never interpreted as dB |
 | De-esser | after compression | `CHAIN` | emitted after the compressor |
@@ -140,7 +146,7 @@ one source of truth for both the numbers and the answer keys.
 | Correlation drop after the chain | > 0.15 | `correlation_drop` | warning when `previous_path` is given; missing correlation on either side is reported unmeasured, not as a zero drop |
 | Sibilance | 5–9 kHz relative to full-band energy | `analysis.SIBILANCE_BAND` | measured as `spectral.sibilance_db_rel`; informs the question, not a de-esser threshold |
 | Noise floor | > −50 dB; minor between −60 and −50 | `GATE.noise_floor_moderate_db`, `GATE.noise_floor_minor_db` | **measured in silence only**; > −50 → `send_back`, > −60 → warning; `None` when the file has no gap |
-| Lossy source | cliff > 20 dB between 14–16 k and 16–18 k | `GATE.lossy_shelf_drop_db` | **measured** (suspected flag or measured drop) → `send_back` |
+| Lossy source | measured cliff > 20 dB in adjacent 1 kHz bands above 10 kHz, up to Nyquist | `GATE.lossy_shelf_drop_db` | **measured** (suspected flag or measured drop) → `send_back`; the reported cutoff is the lower edge of the cliff |
 | `eq.shelf`, `dynamic_eq`, `stereo.width`, `pan` | vocabulary only in the **decision model** | `ACTIONS` | ❌ not emitted by `build_master_recipe`/`build_mix_recipe`; a hand-written `eq.shelf`/`pan` is still applicable by the adapter |
 
 **The decision model never gates.** It scores and chooses treatments; every refusal is measured.
@@ -150,7 +156,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 302 tests: smoke + rules + analysis + adapter + loop
+./start-sound-engineer-mcp.sh --test     # 337 tests: smoke + rules + jev + analysis + adapter + loop
 ```
 
 `tests/test_rules.py` asserts behaviour, plus the limiter's two-constraint arithmetic:
@@ -305,7 +311,7 @@ sensitivity to a known change, not agreement with a trained ear.
 
 ## 8. Status
 
-`0.7.0` (rules 2.1.2). Measurement, gates, sections, references, the recipe contract and a
+`0.9.0` (rules 2.3.0). Measurement, gates, sections, references, the recipe contract and a
 closed apply → export → measure → iterate loop are in place, with CI on 3.9/3.11/3.12. What is
 still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
 

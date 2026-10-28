@@ -10,7 +10,7 @@ import rules  # noqa: E402
 
 
 def _mix_answers(**over):
-    base = {k: {"type": v["type"], "noul": 0.1, "score": 0.0,
+    base = {k: {"type": v["type"], "noul": 0.1, "score": rules.SCORE_MIN,
                 "choice": next(iter(v.get("criteria", {"none": ""})))}
             for k, v in rules.MIX_QUESTIONS.items()}
     for k, v in over.items():
@@ -20,7 +20,7 @@ def _mix_answers(**over):
 
 def _answers(**over):
     base = {k: {"type": v["type"],
-                "noul": 0.1, "score": 0.0,
+                "noul": 0.1, "score": rules.SCORE_MIN,
                 "choice": next(iter(v.get("criteria", {"none": ""})))} for k, v in rules.MASTER_QUESTIONS.items()}
     for k, v in over.items():
         base[k].update(v)
@@ -28,9 +28,13 @@ def _answers(**over):
 
 
 def _master_facts(lufs: float = -18.0, tp: float = -1.0, **extra):
+    stereo = {"phase_correlation": 0.9, "mono_cancel_db": -0.5}
+    stereo.update(extra.pop("stereo", {}))
+    clipping = {"count": 0, "flat_top_frames": 0}
+    clipping.update(extra.pop("clipping", {}))
     base = {"loudness": {"integrated_lufs": lufs, "true_peak_dbtp": tp,
                          "loudness_range_lu": 9.0},
-            "stereo": {"phase_correlation": 0.9}, "clipping": {"count": 0},
+            "stereo": stereo, "clipping": clipping,
             "noise": {"floor_dbfs": None},
             "bandwidth": {"lossy_suspected": False, "drop_db": 0.0},
             "duration_seconds": 60, "sample_rate": 44100}
@@ -187,14 +191,15 @@ def test_corrective_within_cap_is_applied():
 
 
 def test_corrective_beyond_cap_sends_back():
+    # Score 10 maps to 4 dB, above the 3 dB per-move cap; score 8 (3 dB) is fine.
     recipe = rules.build_master_recipe(
-        _answers(low_end={"score": 4.0}), _master_facts(), "spotify")
+        _answers(low_end={"score": 10.0}), _master_facts(), "spotify")
     assert recipe[0]["action"] == "send_back"
     assert any("corrective_beyond_cap" in r for r in recipe[0]["reasons"])
 
 
 def test_cumulative_corrective_includes_the_sibilance_cut():
-    answers = _answers(low_end={"score": 3.5}, high_mid={"score": 3.5},
+    answers = _answers(low_end={"score": 8.0}, high_mid={"score": 8.0},
                        sibilance={"choice": "cut"})
     recipe = rules.build_master_recipe(answers, _master_facts(), "spotify")
     assert recipe[0]["action"] == "send_back"
@@ -312,24 +317,25 @@ def test_neutral_limiter_plan_is_the_fallback_for_missing_loudness():
 
 
 def test_limiter_trim_is_emitted():
-    recipe = rules.build_master_recipe(_answers(), _master_facts(-10.0, 5.0), "spotify")
-    lim = _limiter(recipe)
-    assert lim["input_gain_db"] == -2.0, lim
-    assert lim["expected_gain_reduction_db"] == 4.0, lim
-    warnings = rules.limiter_warnings(recipe)
+    # A true peak above 0 dBTP is refused by the gate before a recipe is built,
+    # so the input-trim arithmetic is tested on the planner itself.
+    plan = rules.plan_limiter(-10.0, 5.0, -1.0)
+    assert plan["input_gain_db"] == -2.0, plan
+    assert plan["expected_gain_reduction_db"] == 4.0, plan
+    warnings = rules.limiter_warnings([{"action": "limiter", **plan}])
     assert any("input trim" in w for w in warnings), warnings
     assert not any("not reached" in w for w in warnings), warnings
 
 
-def test_limiter_absurd_peak_sends_back():
+def test_true_peak_above_zero_sends_back():
     recipe = rules.build_master_recipe(_answers(), _master_facts(-10.0, 7.0), "spotify")
     assert recipe[0]["action"] == "send_back", recipe
-    assert any("peak_beyond_limiter" in r for r in recipe[0]["reasons"]), recipe[0]
+    assert any("true_peak_over_zero" in r for r in recipe[0]["reasons"]), recipe[0]
 
 
 def test_limiter_no_name_error_with_mono_or_noise_facts():
     facts = _master_facts(-18.0, -1.0,
-                          stereo={"phase_correlation": 0.9, "mono_cancel_db": -7.0},
+                          stereo={"phase_correlation": 0.9, "mono_cancel_db": -1.0},
                           noise={"floor_dbfs": -55.0})
     lim = _limiter(rules.build_master_recipe(_answers(), facts, "spotify"))
     assert lim["ceiling_dbtp"] == -1.0, lim
@@ -371,7 +377,8 @@ def test_compressor_targets_the_master_in_a_mastering_recipe():
 
 
 def test_gain_reduction_respects_the_source_range():
-    answers = _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 0.0})
+    answers = _answers(dynamics={"choice": "glue"},
+                       dynamics_amount={"score": rules.SCORE_MIN})
     comp = next(a for a in rules.build_master_recipe(
         answers, _master_facts(), "spotify") if a["action"] == "compressor")
     assert comp["gain_reduction_db"] >= rules.GATE["min_gain_reduction_db"]
@@ -417,7 +424,7 @@ def test_recipe_never_reads_a_key_the_schema_lacks():
     """The test that would have caught low_end/low_mid and vocal_forward."""
     for question_set, builder in ((rules.MASTER_QUESTIONS, rules.build_master_recipe),
                                   (rules.MIX_QUESTIONS, rules.build_mix_recipe)):
-        full = {k: {"type": v["type"], "noul": 0.1, "score": 0.0,
+        full = {k: {"type": v["type"], "noul": 0.1, "score": rules.SCORE_MIN,
                     "choice": next(iter(v.get("criteria", {"none": ""})))} for k, v in question_set.items()}
         args = (full, {}) if builder is rules.build_master_recipe else (full, [])
         builder(*args)                      # must not raise
@@ -565,12 +572,12 @@ def test_require_rejects_missing_field():
 
 
 def test_gain_reduction_budget_uses_peak_gr():
-    """The limiter's 4 dB come from the peak, not from -8 vs the -14 playback figure."""
+    """A 3 dBTP source is refused for the peak itself, before any budget math."""
     facts = _master_facts(-8.0, 3.0)
     recipe = rules.build_master_recipe(
         _answers(dynamics={"choice": "glue"}, dynamics_amount={"score": 10.0}), facts, "spotify")
     assert recipe[0]["action"] == "send_back", recipe
-    assert any("gain_reduction_budget" in r for r in recipe[0]["reasons"]), recipe[0]
+    assert any("true_peak_over_zero" in r for r in recipe[0]["reasons"]), recipe[0]
 
 
 def test_limiter_budget_with_desired_lufs():
@@ -782,7 +789,7 @@ def test_limiter_expect_is_the_true_peak_ceiling():
 
 def test_corrective_expect_names_the_band_and_delta():
     recipe = rules.build_master_recipe(
-        _answers(low_end={"score": 3.0}),
+        _answers(low_end={"score": 6.0}),
         _master_facts(spectral={"bands_db_rel": {"sub": -50.0, "bass": 0.0,
                                                  "low_mid": -45.0, "mid": -40.0,
                                                  "high_mid": -45.0, "high": -50.0}}),
@@ -848,12 +855,145 @@ def test_validate_recipe_rejects_bad_ids_and_expectations():
             "expect_tolerance_invalid"} <= codes, codes
 
 
-def test_upward_expand_is_not_emitted_and_is_named():
+def test_upward_expand_is_not_offered_or_emitted():
     answers = _answers(dynamics={"choice": "expand"})
-    recipe = rules.build_master_recipe(answers, _master_facts(), "spotify")
-    assert not [a for a in recipe if a.get("mode") == "upward_expand"], recipe
+    # The choice is not in the criteria, so the strict validator rejects it
+    # instead of turning a model invention into part of a recipe.
+    try:
+        rules.build_master_recipe(answers, _master_facts(), "spotify")
+    except ValueError as exc:
+        assert "dynamics.choice" in str(exc), exc
+    else:
+        raise AssertionError("an unoffered choice must be rejected")
     warnings = rules.master_warnings(answers)
     assert any("upward expansion" in w for w in warnings), warnings
+
+
+# --- measured gates: flat tops, mono cancel, strict answers -----------------
+def test_flat_topped_ceiling_sends_back():
+    facts = _master_facts(clipping={"count": 0, "flat_top_frames": 5000},
+                          duration_seconds=10)
+    gates = rules.evaluate_gates(facts)
+    assert "clipped:measured" in gates["reasons"], gates
+    assert gates["complete"] is True, gates
+
+
+def test_mono_cancel_gate_and_missing_is_unmeasured():
+    bad = _master_facts(stereo={"mono_cancel_db": -6.5})
+    assert "mono_cancel:measured" in rules.evaluate_gates(bad)["reasons"]
+    facts = _master_facts()
+    del facts["stereo"]["mono_cancel_db"]
+    gates = rules.evaluate_gates(facts)
+    assert "stereo.mono_cancel_db" in gates["unmeasured"], gates
+
+
+def test_corrective_scores_map_onto_db_and_only_the_extreme_sends_back():
+    assert [rules.map_score(s, 0.0, 4.0) for s in (2.0, 4.0, 6.0, 8.0, 10.0)] == \
+        [0.0, 1.0, 2.0, 3.0, 4.0]
+    # Score 2 = no move; 4/6/8 stay under the 3 dB cap; 10 exceeds it.
+    plain = rules.build_master_recipe(
+        _answers(low_end={"score": 2.0}, high_mid={"score": 2.0}), _master_facts(), "spotify")
+    assert not [a for a in plain if a["action"] == "eq.bell"], plain
+    for score, expected in ((4.0, -1.0), (6.0, -2.0), (8.0, -3.0)):
+        recipe = rules.build_master_recipe(
+            _answers(low_end={"score": score}, high_mid={"score": score}),
+            _master_facts(), "spotify")
+        bells = [a for a in recipe if a["action"] == "eq.bell"]
+        assert [b["gain_db"] for b in bells] == [expected, expected], (score, recipe)
+    extreme = rules.build_master_recipe(_answers(low_end={"score": 10.0}),
+                                       _master_facts(), "spotify")
+    assert extreme[0]["action"] == "send_back", extreme
+
+
+def test_masking_scores_map_onto_the_corrective_cap():
+    stem_facts = [
+        {"name": "01_vocals", "path": "/s/01_vocals.wav",
+         "bands_db_rel": {"sub": -40.0, "bass": -30.0, "low_mid": -20.0,
+                          "mid": -8.0, "high_mid": -15.0, "high": -25.0}},
+        {"name": "02_gtr", "path": "/s/02_gtr.wav",
+         "bands_db_rel": {"sub": -45.0, "bass": -35.0, "low_mid": -25.0,
+                          "mid": -9.0, "high_mid": -18.0, "high": -28.0}},
+    ]
+    for score, cut in ((4.0, 0.8), (6.0, 1.5), (8.0, 2.2), (10.0, 3.0)):
+        plan = rules._masking_plan(_mix_answers(masking={"score": score}), stem_facts)
+        assert plan["cut_db"] == cut, (score, plan)
+    assert rules._masking_plan(_mix_answers(masking={"score": 2.0}), stem_facts) is None
+
+
+def test_require_rejects_out_of_domain_answers():
+    cases = [
+        (_answers(low_end={"score": 11.0}), "low_end.score"),
+        (_answers(low_end={"score": float("nan")}), "low_end.score"),
+        (_answers(low_end={"score": "heavy"}), "low_end.score"),
+        (_answers(sibilance={"choice": "boost"}), "sibilance.choice"),
+        (_answers(low_end={"noul": 1.5}), "low_end.noul"),
+        (_answers(low_end={"confidence": -0.1}), "low_end.confidence"),
+    ]
+    for answers, expected in cases:
+        try:
+            rules.build_master_recipe(answers, _master_facts(), "spotify")
+        except ValueError as exc:
+            assert expected in str(exc), (expected, exc)
+        else:
+            raise AssertionError(f"{expected} must be rejected")
+
+
+def test_confidence_report_separates_low_from_unknown():
+    report = rules.confidence_report({"a": {"confidence": 0.2},
+                                      "b": {"confidence": 0.9}, "c": {}})
+    assert report["low"] == {"a": 0.2}, report
+    assert report["unknown"] == ["c"], report
+    assert report["needs_human"] is True, report
+    assert rules.confidence_report({"a": {"confidence": 0.9}})["needs_human"] is False
+
+
+def test_mix_warnings_explain_measured_gates():
+    gates = [{"gate": "vocal_buried", "stem": "01_vocals", "relative_db": -14.0},
+             {"gate": "single_element_peak", "stem": "02_drums", "excess_db": 8.0}]
+    warnings = rules.mix_warnings(_mix_answers(), [], gates=gates)
+    assert any("raise the vocal bus" in w for w in warnings), warnings
+    assert any("02_drums" in w and "lower or automate" in w for w in warnings), warnings
+
+
+def test_temporal_overlap_pairs_beat_the_static_minimum():
+    answers = _mix_answers(masking={"score": 8.0})
+    stem_facts = [
+        {"name": "01_vocals", "path": "/s/01_vocals.wav",
+         "bands_db_rel": {"sub": -40.0, "bass": -30.0, "low_mid": -20.0,
+                          "mid": -10.0, "high_mid": -12.0, "high": -30.0}},
+        {"name": "02_gtr", "path": "/s/02_gtr.wav",
+         "bands_db_rel": {"sub": -45.0, "bass": -35.0, "low_mid": -25.0,
+                          "mid": -11.0, "high_mid": -13.0, "high": -32.0}},
+    ]
+    # The static minimum would pick mid; the co-activity measurement says high_mid
+    # and only while both play, and it must win.
+    pairs = [{"a": "01_vocals", "b": "02_gtr", "band_overlap_db": -6.0,
+              "dominant_band": "high_mid", "dominant_band_overlap_db": -6.0,
+              "coactive_fraction": 0.4}]
+    bell = next(a for a in rules.build_mix_recipe(answers, [], stem_facts, pairs)
+                if a["action"] == "eq.bell")
+    assert bell["band"] == "high_mid", bell
+    assert bell["stems"] == ["01_vocals", "02_gtr"], bell
+    assert bell["gain_db"] == -2.2, bell
+
+
+def test_never_coactive_stems_do_not_get_a_masking_bell():
+    answers = _mix_answers(masking={"score": 8.0})
+    stem_facts = [
+        {"name": "01_vocals", "path": "/s/01_vocals.wav",
+         "bands_db_rel": {"sub": -40.0, "bass": -30.0, "low_mid": -20.0,
+                          "mid": -8.0, "high_mid": -12.0, "high": -30.0}},
+        {"name": "02_gtr", "path": "/s/02_gtr.wav",
+         "bands_db_rel": {"sub": -45.0, "bass": -35.0, "low_mid": -25.0,
+                          "mid": -9.0, "high_mid": -13.0, "high": -32.0}},
+    ]
+    pairs = [{"a": "01_vocals", "b": "02_gtr", "band_overlap_db": None,
+              "dominant_band": None, "dominant_band_overlap_db": None,
+              "coactive_fraction": 0.0}]
+    recipe = rules.build_mix_recipe(answers, [], stem_facts, pairs)
+    assert not [a for a in recipe if a["action"] == "eq.bell"], recipe
+    warnings = rules.mix_warnings(answers, [], stem_facts, pairs)
+    assert any("no stem band data" in w for w in warnings), warnings
 
 
 if __name__ == "__main__":

@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import sys
+from urllib.parse import urlsplit
 
 try:  # installed as a package
     from . import rules
@@ -20,7 +21,9 @@ except ImportError:  # executed as a script: python server/engineer_server.py
     from jev import ask, config
 
 SERVER_NAME = "mcp_sound_engineer"
-SERVER_VERSION = "0.8.0"
+SERVER_VERSION = "0.9.0"
+MAX_BODY_BYTES = 8 * 1024 * 1024
+LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 # Jev schemas live in rules.py: one source of truth for the answer keys.
 MASTER_QUESTIONS = rules.MASTER_QUESTIONS
@@ -149,7 +152,12 @@ def tool_judge_master(path: str, platform: str = "spotify",
     warnings += rules.master_warnings(answers)
     warnings += rules.limiter_warnings(recipe)
     if confidence["needs_human"]:
-        warnings.append(f"low confidence on {sorted(confidence['low'])}; treat the recipe as a draft")
+        parts = []
+        if confidence["low"]:
+            parts.append(f"low confidence on {sorted(confidence['low'])}")
+        if confidence["unknown"]:
+            parts.append(f"no confidence reported for {confidence['unknown']}")
+        warnings.append("; ".join(parts) + "; treat the recipe as a draft")
     if previous_path:
         drop = rules.correlation_drop(analyze_master(previous_path), facts)
         if drop.get("unmeasured"):
@@ -174,13 +182,22 @@ def tool_judge_mix(paths: list[str]) -> dict:
              "limits": rules.GATE}
     answers = ask(state, MIX_QUESTIONS)
     names = [s["path"] for s in facts["stems"]]
+    overlap_pairs = facts.get("band_overlap_pairs", [])
+    gates = facts.get("gates", [])
     confidence = rules.confidence_report(answers)
-    warnings = rules.mix_warnings(answers, names, facts["stems"])
+    # Two gates get an actionable line from mix_warnings; the rest stay generic.
+    explained = {"vocal_buried", "single_element_peak"}
+    warnings = rules.mix_warnings(answers, names, facts["stems"], overlap_pairs, gates)
     if confidence["needs_human"]:
-        warnings.append(f"low confidence on {sorted(confidence['low'])}; treat the recipe as a draft")
-    warnings += [f"{g['gate']}: {g}" for g in facts.get("gates", [])]
+        parts = []
+        if confidence["low"]:
+            parts.append(f"low confidence on {sorted(confidence['low'])}")
+        if confidence["unknown"]:
+            parts.append(f"no confidence reported for {confidence['unknown']}")
+        warnings.append("; ".join(parts) + "; treat the recipe as a draft")
+    warnings += [f"{g['gate']}: {g}" for g in gates if g.get("gate") not in explained]
     return {"facts": facts, "answers": answers,
-            "recipe": rules.build_mix_recipe(answers, names, facts["stems"]),
+            "recipe": rules.build_mix_recipe(answers, names, facts["stems"], overlap_pairs),
             "confidence": confidence,
             "warnings": warnings}
 
@@ -353,6 +370,29 @@ def _dispatch(msg) -> dict | None:
         return make_error(rid, -32603, f"internal error: {exc}")
 
 
+def _loopback_name(value: str | None) -> str | None:
+    """Hostname of a Host/Origin value, or None when it cannot be parsed."""
+    if not isinstance(value, str) or not value:
+        return None
+    try:
+        parsed = urlsplit(value if "://" in value else "//" + value)
+        parsed.port                          # malformed ports raise here
+        return parsed.hostname
+    except ValueError:
+        return None
+
+
+def _host_allowed(host_header: str | None) -> bool:
+    return _loopback_name(host_header) in LOOPBACK_HOSTS
+
+
+def _origin_allowed(origin: str | None) -> bool:
+    """No Origin (non-browser MCP client) is fine; a cross-origin page is not."""
+    if origin is None:
+        return True
+    return _loopback_name(origin) in LOOPBACK_HOSTS
+
+
 def serve_http(port: int = 8766) -> None:
     """Optional transport, mirroring the usual MCP bridge shape: POST /mcp + GET /health."""
     from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
@@ -366,16 +406,38 @@ def serve_http(port: int = 8766) -> None:
             self.end_headers()
             self.wfile.write(body)
 
+        def _guard(self) -> bool:
+            """DNS-rebinding / cross-site guard. Must run before the body is read."""
+            if not _host_allowed(self.headers.get("Host")):
+                self._send(403, {"error": "forbidden host"})
+                return False
+            if not _origin_allowed(self.headers.get("Origin")):
+                self._send(403, {"error": "forbidden origin"})
+                return False
+            return True
+
         def do_GET(self):  # noqa: N802
+            if not self._guard():
+                return
             if self.path == "/health":
                 self._send(200, {"status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION})
             else:
                 self._send(200, {"server": SERVER_NAME, "mcp": "POST /mcp", "health": "/health"})
 
         def do_POST(self):  # noqa: N802
+            if not self._guard():
+                return
             if self.path not in ("/mcp", "/"):
                 return self._send(404, {"error": "not found"})
-            length = int(self.headers.get("Content-Length") or 0)
+            raw_length = self.headers.get("Content-Length")
+            try:
+                length = int(raw_length) if raw_length is not None else 0
+            except (TypeError, ValueError):
+                return self._send(400, {"error": "invalid Content-Length"})
+            if length < 0:
+                return self._send(400, {"error": "invalid Content-Length"})
+            if length > MAX_BODY_BYTES:
+                return self._send(413, {"error": "request body too large"})
             try:
                 msg = json.loads(self.rfile.read(length) or b"{}")
             except json.JSONDecodeError:

@@ -1,9 +1,12 @@
 """Smoke test: analysis on a synthetic file + the MCP handshake. No network."""
+import http.client
 import json
 import os
+import socket
 import subprocess
 import sys
 import tempfile
+import time
 import wave
 
 import numpy as np
@@ -34,7 +37,7 @@ def _master_answers():
     answers = {}
     for key, spec in engineer_server.MASTER_QUESTIONS.items():
         if spec["type"] == "score":
-            answers[key] = {"score": 0.0}
+            answers[key] = {"score": engineer_server.rules.SCORE_MIN}
         else:
             answers[key] = {"choice": next(iter(spec["criteria"]))}
     return answers
@@ -80,6 +83,9 @@ def test_mcp_handshake():
     info = send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                  "params": {"name": "engineer_info", "arguments": {}}})
     assert info["result"]["isError"] is False
+    payload = json.loads(info["result"]["content"][0]["text"])
+    assert payload["version"] == engineer_server.SERVER_VERSION, payload
+    assert payload["rules_version"] == engineer_server.rules.RULES_VERSION, payload
     proc.stdin.close(); proc.wait(timeout=5)
     print("mcp handshake ok:", sorted(names))
 
@@ -200,8 +206,8 @@ def test_judge_master_names_the_generic_reference_fallback():
         "spectral": {"bands_db_rel": {"sub": -20.0, "bass": -10.0, "low_mid": -12.0,
                                       "mid": -8.0, "high_mid": -13.0, "high": -17.0},
                      "sibilance_db_rel": -20.0},
-        "stereo": {"phase_correlation": 0.9, "mono_cancel_db": -30.0},
-        "clipping": {"count": 0, "samples": 0, "proportion": 0.0},
+        "stereo": {"phase_correlation": 0.9, "mono_cancel_db": -0.5},
+        "clipping": {"count": 0, "flat_top_frames": 0, "samples": 0, "proportion": 0.0},
         "noise": {"floor_dbfs": None},
         "bandwidth": {"lossy_suspected": False, "drop_db": 0.0, "cutoff_hz": 20000},
     }
@@ -261,6 +267,92 @@ def test_judge_master_passes_measured_reference_and_intent():
     assert captured["desired_lufs"] == -14.0, captured
     assert result["reference_curve"] == expected_curve, result
     assert result["recipe"] == [], result
+
+
+def _free_port() -> int:
+    with socket.socket() as sock:
+        sock.bind(("127.0.0.1", 0))
+        return int(sock.getsockname()[1])
+
+
+def _wait_health(port: int, timeout: float = 10.0) -> None:
+    deadline = time.time() + timeout
+    while time.time() < deadline:
+        try:
+            conn = http.client.HTTPConnection("127.0.0.1", port, timeout=1)
+            conn.request("GET", "/health")
+            conn.getresponse().read()
+            conn.close()
+            return
+        except OSError:
+            time.sleep(0.1)
+    raise AssertionError("the HTTP server did not start")
+
+
+def test_judge_master_short_file_returns_a_terminal_recipe():
+    """A <3 s file has no LRA; the gate refuses it instead of crashing."""
+    original_ask = engineer_server.ask
+    engineer_server.ask = lambda state, questions: _master_answers()
+    try:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = os.path.join(tmp, "short.wav")
+            make_wav(path, seconds=1.0)
+            result = engineer_server.tool_judge_master(path)
+    finally:
+        engineer_server.ask = original_ask
+    recipe = result["recipe"]
+    assert len(recipe) == 1 and recipe[0]["action"] == "send_back", recipe
+    assert any("unmeasured:loudness.loudness_range_lu" in r for r in recipe[0]["reasons"]), recipe
+
+
+def test_http_rejects_foreign_host_origin_and_oversized_body():
+    port = _free_port()
+    proc = subprocess.Popen([sys.executable,
+                             os.path.join(ROOT, "server", "engineer_server.py"),
+                             "--http", "--port", str(port)],
+                            stdout=subprocess.DEVNULL, stderr=subprocess.DEVNULL)
+    try:
+        _wait_health(port)
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/health")
+        health = conn.getresponse()
+        body = json.loads(health.read())
+        conn.close()
+        assert health.status == 200 and body["version"] == engineer_server.SERVER_VERSION, body
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/health", headers={"Host": "evil.example"})
+        assert conn.getresponse().status == 403, "a foreign Host must be refused"
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        payload = json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping", "params": {}})
+        conn.request("POST", "/mcp", body=payload,
+                     headers={"Content-Type": "application/json",
+                              "Origin": "https://evil.example"})
+        assert conn.getresponse().status == 403, "a cross-site Origin must be refused"
+        conn.close()
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("POST", "/mcp", body=payload,
+                     headers={"Content-Type": "application/json",
+                              "Origin": "http://localhost:3000"})
+        response = conn.getresponse()
+        reply = json.loads(response.read())
+        conn.close()
+        assert response.status == 200 and reply["result"] == {}, reply
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.putrequest("POST", "/mcp")
+        conn.putheader("Host", f"127.0.0.1:{port}")
+        conn.putheader("Content-Length", str(engineer_server.MAX_BODY_BYTES + 1))
+        conn.endheaders()
+        assert conn.getresponse().status == 413, "an oversized body must be refused"
+        conn.close()
+    finally:
+        proc.terminate()
+        proc.wait(timeout=5)
 
 
 if __name__ == "__main__":
