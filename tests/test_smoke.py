@@ -76,10 +76,12 @@ def test_mcp_handshake():
     init = send({"jsonrpc": "2.0", "id": 1, "method": "initialize", "params": {}})
     assert init["result"]["serverInfo"]["name"] == "mcp_sound_engineer"
     listing = send({"jsonrpc": "2.0", "id": 2, "method": "tools/list", "params": {}})
-    names = {t["name"] for t in listing["result"]["tools"]}
+    tools = listing["result"]["tools"]
+    names = {t["name"] for t in tools}
     assert names == {"analyze_master", "analyze_stems", "analyze_sections", "analyze_reference",
                      "judge_master", "judge_mix", "validate_recipe", "verify_recipe",
                      "engineer_info"}
+    assert all(t["annotations"]["readOnlyHint"] is True for t in tools), tools
     info = send({"jsonrpc": "2.0", "id": 3, "method": "tools/call",
                  "params": {"name": "engineer_info", "arguments": {}}})
     assert info["result"]["isError"] is False
@@ -194,6 +196,19 @@ def test_verify_recipe_checks_measurements_after_the_bounce():
     assert checks["missing"]["status"] == "unmeasured", checks["missing"]
     assert result["met"] == 1 and result["unmeasured"] == 1, result
     assert result["all_met"] is False, result
+
+
+def test_jev_state_contains_basenames_not_local_paths():
+    facts = {
+        "file": "/Users/alice/Music/master.wav",
+        "stems": [{"path": "/Users/alice/Stems/01_vocals.wav", "integrated_lufs": -18.0}],
+    }
+    safe = engineer_server._jev_facts(facts)
+    assert safe["file"] == "master.wav", safe
+    assert safe["stems"][0]["path"] == "01_vocals.wav", safe
+    assert "/Users" not in json.dumps(safe), safe
+    # The local client still receives the full path in `facts`.
+    assert facts["file"].startswith("/Users/alice")
 
 
 def test_judge_master_names_the_generic_reference_fallback():

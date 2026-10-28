@@ -256,13 +256,29 @@ def _k_weighted_channels(data, sr: int, chunk: int = 1 << 20) -> np.ndarray:
 
     `integrated_lufs` and `loudness_range` need the same filtered signal; doing
     it twice doubled the dominant cost of a full-track measurement.
+
+    Filtering each chunk on its own used to treat it as a complete periodic
+    signal, so the filter's tail wrapped around at every chunk boundary. Each
+    chunk now carries half a second of real pre-roll and zero padding on both
+    sides: the padding absorbs the circular wrap, and the pre-roll lets the IIR
+    state settle before the samples that are kept. The result is independent of
+    the chunk size (the 38 Hz high-pass has a ~4 ms time constant, so 0.5 s is
+    far longer than its decay).
     """
     x = _as_channels(data)
+    n = x.shape[0]
     out = np.empty_like(x)
-    for start in range(0, x.shape[0], chunk):
-        stop = min(start + chunk, x.shape[0])
+    pad = max(2048, min(int(0.5 * sr), n))
+    for start in range(0, n, chunk):
+        stop = min(start + chunk, n)
+        left = min(pad, start)
+        right = min(pad, n - stop)
+        base, end = start - left, stop + right
         for channel in range(x.shape[1]):
-            out[start:stop, channel] = _k_weighted(x[start:stop, channel], sr)
+            segment = x[base:end, channel]
+            padded = np.concatenate([np.zeros(pad), segment, np.zeros(pad)])
+            filtered = _k_weighted(padded, sr)
+            out[start:stop, channel] = filtered[pad + left:pad + left + (stop - start)]
     return out
 
 

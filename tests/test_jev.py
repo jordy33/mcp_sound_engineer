@@ -41,7 +41,7 @@ def _http_error(code: int, body: bytes = b"error", retry_after: str | None = Non
                                   "error", headers, io.BytesIO(body))
 
 
-def _ask_with(side_effect, sleeps=None):
+def _ask_with(side_effect, sleeps=None, questions=None):
     patches = [mock.patch.object(jev, "config", return_value=dict(CFG)),
                mock.patch.object(jev.urllib.request, "urlopen", side_effect=side_effect)]
     if sleeps is not None:
@@ -49,7 +49,8 @@ def _ask_with(side_effect, sleeps=None):
                                          side_effect=lambda s: sleeps.append(s)))
     with patches[0], patches[1]:
         with (patches[2] if sleeps is not None else mock.patch.object(jev.time, "sleep")):
-            return jev.ask({"facts": {}}, {"low_end": {"type": "score"}})
+            return jev.ask({"facts": {}},
+                           questions or {"low_end": {"type": "score"}})
 
 
 # --- .env parsing -----------------------------------------------------------
@@ -103,12 +104,14 @@ def test_ask_returns_the_answers_map():
 
 
 def test_timeout_becomes_a_domain_error():
+    sleeps = []
     try:
-        _ask_with([TimeoutError("slow")])
+        _ask_with([TimeoutError("slow")] * jev.MAX_ATTEMPTS, sleeps)
     except jev.JevError as exc:
         assert "request failed" in str(exc), exc
     else:
         raise AssertionError("a timeout must not escape as TimeoutError")
+    assert len(sleeps) == jev.MAX_ATTEMPTS - 1, sleeps
 
 
 def test_invalid_json_becomes_a_domain_error():
@@ -122,7 +125,7 @@ def test_invalid_json_becomes_a_domain_error():
 
 def test_protocol_error_becomes_a_domain_error():
     try:
-        _ask_with([http.client.RemoteDisconnected("gone")])
+        _ask_with([http.client.RemoteDisconnected("gone")] * jev.MAX_ATTEMPTS)
     except jev.JevError as exc:
         assert "protocol error" in str(exc), exc
     else:
@@ -131,11 +134,20 @@ def test_protocol_error_becomes_a_domain_error():
 
 def test_unreachable_host_becomes_a_domain_error():
     try:
-        _ask_with([urllib.error.URLError("dns")])
+        _ask_with([urllib.error.URLError("dns")] * jev.MAX_ATTEMPTS)
     except jev.JevError as exc:
         assert "unreachable" in str(exc), exc
     else:
         raise AssertionError("a URLError must become a JevError")
+
+
+def test_transient_transport_failures_are_retried():
+    sleeps = []
+    response = _Response(json.dumps({"answers": ANSWERS}).encode())
+    result = _ask_with([TimeoutError("slow"), urllib.error.URLError("reset"),
+                        response], sleeps)
+    assert result == ANSWERS
+    assert sleeps == [0.5, 1.0], sleeps
 
 
 # --- retries ----------------------------------------------------------------
@@ -171,7 +183,46 @@ def test_retry_after_wait_is_capped():
     assert sleeps == [jev.RETRY_MAX_DELAY_S], sleeps
 
 
+def test_total_deadline_stops_before_an_attempt():
+    calls = []
+
+    def side_effect(*args, **kwargs):
+        calls.append(1)
+        raise AssertionError("urlopen must not be called past the deadline")
+
+    with mock.patch.object(jev.urllib.request, "urlopen", side_effect=side_effect):
+        try:
+            jev._post("https://api.example.test/decide", "key", {},
+                      5.0, deadline=jev.time.monotonic() - 1.0)
+        except jev.JevError as exc:
+            assert "deadline" in str(exc), exc
+        else:
+            raise AssertionError("an expired deadline must stop the request")
+    assert calls == [], calls
+
+
 # --- response validation ----------------------------------------------------
+def test_ask_rejects_a_response_that_omits_a_question():
+    questions = {"low_end": {"type": "score"}, "dynamics": {"type": "choice"}}
+    response = _Response(json.dumps({"answers": {"low_end": {"score": 4.0}}}).encode())
+    try:
+        _ask_with([response], questions=questions)
+    except jev.JevError as exc:
+        assert "missing answers" in str(exc) and "dynamics" in str(exc), exc
+    else:
+        raise AssertionError("a partial answer map must not be accepted")
+
+
+def test_ask_rejects_non_object_answers():
+    response = _Response(json.dumps({"answers": []}).encode())
+    try:
+        _ask_with([response])
+    except jev.JevError as exc:
+        assert "unexpected Jev answers" in str(exc), exc
+    else:
+        raise AssertionError("answers must be an object")
+
+
 def test_require_rejects_answers_outside_the_schema():
     questions = {"low_end": {"type": "score"}}
     for bad in (0.0, 12.0, float("nan"), "heavy", None):

@@ -116,6 +116,22 @@ def test_lufs_survives_out_of_phase_channels():
     assert lufs > -30, lufs          # the old mono average read silence here
 
 
+def test_k_weighting_does_not_depend_on_the_internal_chunk_size():
+    """Each chunk is filtered independently; its boundaries must not leak.
+
+    Without padding, treating each chunk as a periodic signal wraps the filter
+    tail into the next chunk and changes the weighted samples (and therefore
+    LUFS) with the chunk size.
+    """
+    rng = np.random.default_rng(11)
+    x = 0.05 * rng.normal(size=(SR * 2, 2))
+    whole = analysis._k_weighted_channels(x, SR, chunk=1 << 20)
+    chunked = analysis._k_weighted_channels(x, SR, chunk=4096)
+    assert np.max(np.abs(whole - chunked)) < 1e-9
+    assert analysis.integrated_lufs(x, SR, weighted=whole) == \
+        analysis.integrated_lufs(x, SR, weighted=chunked)
+
+
 def test_true_peak_is_accurate_on_a_pure_tone():
     tone = _sine(997, 0.5)
     tp = analysis.true_peak_dbtp(tone, SR)

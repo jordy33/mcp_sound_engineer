@@ -16,10 +16,14 @@ JEV_LIVE_ENDPOINT = "https://jevtypesafeai.com/api/v1/decide"
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
 # 429 and 5xx are transient; any other 4xx is a request problem that a retry
-# would only repeat. Attempts are bounded, including any Retry-After wait.
+# would only repeat. Timeouts and connection failures are also transient. The
+# number of attempts and the total wall-clock budget are both bounded, so a
+# stalled endpoint cannot outlive a typical MCP client timeout.
 MAX_ATTEMPTS = 3
 RETRY_BASE_DELAY_S = 0.5
 RETRY_MAX_DELAY_S = 5.0
+DEFAULT_TIMEOUT_S = 20.0
+MAX_TOTAL_SECONDS = 45.0
 
 
 class JevError(RuntimeError):
@@ -136,41 +140,75 @@ def _error_detail(exc: urllib.error.HTTPError) -> str:
         return ""
 
 
-def _post(url: str, key: str, body: dict, timeout: int) -> bytes:
+def _transport_delay(attempt: int) -> float:
+    return min(RETRY_BASE_DELAY_S * (2 ** (attempt - 1)), RETRY_MAX_DELAY_S)
+
+
+def _wait_before_retry(delay: float, deadline: float) -> None:
+    """Sleep only if another attempt still fits inside the total budget."""
+    remaining = deadline - time.monotonic()
+    if remaining <= 0 or delay >= remaining:
+        raise JevError("Jev retry deadline exceeded")
+    time.sleep(delay)
+
+
+def _post(url: str, key: str, body: dict, timeout: float,
+          deadline: float | None = None) -> bytes:
     data = json.dumps(body).encode()
+    deadline = time.monotonic() + MAX_TOTAL_SECONDS if deadline is None else deadline
     for attempt in range(1, MAX_ATTEMPTS + 1):
+        remaining = deadline - time.monotonic()
+        if remaining <= 0:
+            raise JevError("Jev retry deadline exceeded")
         req = urllib.request.Request(
             url, data=data,
             headers={"Content-Type": "application/json",
                      "Authorization": f"Bearer {key}"})
         try:
-            with urllib.request.urlopen(req, timeout=timeout) as resp:
+            with urllib.request.urlopen(req, timeout=max(0.1, min(timeout, remaining))) as resp:
                 return resp.read()
         except urllib.error.HTTPError as exc:
             detail = _error_detail(exc)
             transient = exc.code == 429 or 500 <= exc.code < 600
             if transient and attempt < MAX_ATTEMPTS:
-                time.sleep(_retry_delay(exc, attempt))
+                _wait_before_retry(_retry_delay(exc, attempt), deadline)
                 continue
             raise JevError(f"Jev HTTP {exc.code}: {detail}") from exc
         except urllib.error.URLError as exc:
+            if attempt < MAX_ATTEMPTS:
+                _wait_before_retry(_transport_delay(attempt), deadline)
+                continue
             raise JevError(f"Jev unreachable: {exc.reason}") from exc
         except http.client.HTTPException as exc:
             # RemoteDisconnected inherits from both ConnectionResetError and
             # BadStatusLine; name it as a protocol error, not a generic OSError.
+            if attempt < MAX_ATTEMPTS:
+                _wait_before_retry(_transport_delay(attempt), deadline)
+                continue
             raise JevError(f"Jev protocol error: {type(exc).__name__}: {exc}") from exc
-        except (TimeoutError, OSError) as exc:
+        except TimeoutError as exc:
+            if attempt < MAX_ATTEMPTS:
+                _wait_before_retry(_transport_delay(attempt), deadline)
+                continue
+            raise JevError(f"Jev request failed: {type(exc).__name__}: {exc}") from exc
+        except OSError as exc:
+            if attempt < MAX_ATTEMPTS:
+                _wait_before_retry(_transport_delay(attempt), deadline)
+                continue
             raise JevError(f"Jev request failed: {type(exc).__name__}: {exc}") from exc
         except ValueError as exc:
             raise JevError(f"invalid Jev endpoint: {exc}") from exc
     raise JevError("Jev retry budget exhausted")   # unreachable, loop always returns
 
 
-def ask(state: dict, questions: dict, timeout: int = 60) -> dict:
-    """Send one decision request. Returns the `answers` map.
+def ask(state: dict, questions: dict, timeout: float = DEFAULT_TIMEOUT_S) -> dict:
+    """Send one decision request. Returns the complete `answers` map.
 
     Transport failures become JevError so the MCP server reports a domain error
-    instead of surfacing urllib internals. Only 429/5xx are retried.
+    instead of surfacing urllib internals. Transient HTTP codes, timeouts and
+    connection failures are retried within a bounded total deadline. A response
+    that omits any question is an error: a missing answer must not read as
+    "nothing to fix".
     """
     cfg = config()
     if not cfg["key"]:
@@ -184,4 +222,10 @@ def ask(state: dict, questions: dict, timeout: int = 60) -> dict:
         raise JevError(f"Jev returned invalid JSON: {exc}") from exc
     if not isinstance(payload, dict) or "answers" not in payload:
         raise JevError(f"unexpected Jev response: {str(payload)[:300]}")
-    return payload["answers"]
+    answers = payload["answers"]
+    if not isinstance(answers, dict):
+        raise JevError(f"unexpected Jev answers: {str(answers)[:300]}")
+    missing = [name for name in questions if name not in answers]
+    if missing:
+        raise JevError(f"Jev response is missing answers for {missing}")
+    return answers

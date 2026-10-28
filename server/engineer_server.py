@@ -21,7 +21,7 @@ except ImportError:  # executed as a script: python server/engineer_server.py
     from jev import ask, config
 
 SERVER_NAME = "mcp_sound_engineer"
-SERVER_VERSION = "0.9.0"
+SERVER_VERSION = "0.9.1"
 MAX_BODY_BYTES = 8 * 1024 * 1024
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -336,7 +336,10 @@ def handle(msg: dict) -> dict | None:
         return make_result(rid, {})
     if method == "tools/list":
         return make_result(rid, {"tools": [
-            {"name": name, "description": t["description"], "inputSchema": t["inputSchema"]}
+            {"name": name, "description": t["description"], "inputSchema": t["inputSchema"],
+             # Every tool only reads files or asks for a decision; none edits audio
+             # or writes to disk. Clients may call them without a confirmation.
+             "annotations": {"readOnlyHint": True}}
             for name, t in TOOLS.items()]})
     if method == "tools/call":
         name = params.get("name")

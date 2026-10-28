@@ -108,6 +108,9 @@ translation from recipe to calls is `adapter/`, a client of `mcp_logic`, not ano
 | `judge_mix` | stem paths | `answers` + `recipe`; the masking bell uses the measured overlap pair and band, not a fixed 300 Hz |
 | `engineer_info` | — | rules version, Jev status, platforms |
 
+Every tool advertises `annotations.readOnlyHint: true`: none edits audio or writes files, so a
+client may call them without a confirmation prompt.
+
 ## 5. The rules, and where they live
 
 Sources: the [mastering-engineer methodology](https://github.com/fadelabs/phantom/blob/main/plugin/skills/mastering-engineer/SKILL.md)
@@ -156,7 +159,7 @@ component scores (0.81 refuse, yet `low_end` 1.46 and `high_mid` 1.68 — both "
 ### How to know a rule is real
 
 ```bash
-./start-sound-engineer-mcp.sh --test     # 342 tests: smoke + rules + jev + analysis + adapter + loop
+./start-sound-engineer-mcp.sh --test     # 348 tests: smoke + rules + jev + analysis + adapter + loop
 ```
 
 `tests/test_rules.py` asserts behaviour, plus the limiter's two-constraint arithmetic:
@@ -311,7 +314,7 @@ sensitivity to a known change, not agreement with a trained ear.
 
 ## 8. Status
 
-`0.9.0` (rules 2.3.0). Measurement, gates, sections, references, the recipe contract and a
+`0.9.1` (rules 2.3.0). Measurement, gates, sections, references, the recipe contract and a
 closed apply → export → measure → iterate loop are in place, with CI on 3.9/3.11/3.12. What is
 still missing is tracked in [`docs/LIMITS.md`](docs/LIMITS.md):
 

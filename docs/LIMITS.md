@@ -37,7 +37,7 @@ implemented (`analyze_sections`, `analyze_reference`, `judge_master.previous_pat
 
 | Metric | Reality |
 |---|---|
-| `integrated_lufs` | one deterministic implementation: BS.1770 K-weighting with coefficients derived for the actual sample rate (44.1/48/96 kHz agree with `pyloudnorm`/`ffmpeg ebur128` within ~0.2 LU). `pyloudnorm` is not used at runtime |
+| `integrated_lufs` | one deterministic implementation: BS.1770 K-weighting with coefficients derived for the actual sample rate (44.1/48/96 kHz agree with `pyloudnorm`/`ffmpeg ebur128` within ~0.2 LU). Long files are filtered in chunks with real pre-roll and zero padding, so the result does not depend on the chunk size. `pyloudnorm` is not used at runtime |
 | `true_peak_dbtp` | 4× polyphase FIR over the whole file, edges included (BS.1770 minimum). Dedicated meters use 8× — expect ±0.3 dB on normal material, more near Nyquist |
 | `loudness_range_lu` | EBU R128 / Tech 3342: K-weighted 3 s short-term loudness, −70 LUFS absolute gate, −20 LU relative gate, P95−P10. `null` when the file is shorter than 3 s |
 | channel layouts | 1–2 channels use unit weights; 6 channels are assumed to be the standard WAV order FL/FR/FC/LFE/BL/BR (Ls/Rs at +1.5 dB, LFE excluded). WAV carries no layout metadata, and any other channel count raises instead of guessing |
@@ -74,6 +74,9 @@ look identical to a band-energy vector.
 * Its confidence is calibrated by design, but **not validated for this domain yet**. Do not threshold
   on it until you run a labelled set.
 * Network call per judgement (~0.3 s, ~$0.0002). Cache identical states.
+* Transient 429/5xx responses, timeouts and connection failures are retried (3 attempts) under a
+  45 s total deadline. A response that omits any question is rejected: a missing answer is never
+  read as "nothing to fix".
 
 ## Validation status
 
