@@ -30,6 +30,16 @@ Este skill es el adaptador: traduce la receta a llamadas de Logic, de forma hone
 - **Respaldo:** `logic_project` → `save_as` a una copia (ej. `<nombre>_pre-engineer.logicx`) antes de mutar nada. Verifica que el paquete existe.
 - Nota de locale: si el Logic del usuario está en español (es-ES), la mayoría de las etiquetas de UI están *derivadas*, no medidas. Si fallan operaciones de UI de forma rara, sugiere probar con Logic en inglés.
 
+### 1b. Mixer: qué superficie leer y cómo abrirla
+
+`logic_plugins.get_inventory` lee los inserts desde el Mixer. Medido en Logic 12.4 el 2026-11-02:
+
+- Usa `mixer_window: "detached"`. El panel acoplado (`View > Show Mixer`) nombra todo insert ocupado como `audio plug-in`; la ventana detachada (`Window > Open Mixer`) da el nombre real (`Channel EQ`, `Compressor`).
+- Si la ventana detachada no existe, `mixer_window:"detached"` **falla cerrado** con `detached_mixer_not_visible`; no contesta con el panel acoplado. Pasa `reveal_mixer: true` y mcp_logic la abre él mismo (⌘2), espera a que aparezca y la enlaza. La respuesta lo declara en `mixer_reveal_strategies` (`["cgevent_cmd2_open_mixer"]`) y en `mixer_window_title`; si no aparece, sigue siendo State B y nunca finge haberla abierto.
+- **El strip tiene que estar visible en el Mixer.** Un insert fuera de la zona visible solo expone el placeholder `audio plug-in`, y la lectura devuelve State B `occupied_insert_name_unreadable` aunque la ventana sea la detachada. Antes de leer el master, desplaza el Mixer horizontalmente hasta Stereo Out (extremo derecho) y reintenta.
+- `strip: "output"` direcciona el master (Stereo Out), que no tiene índice de Arrange; el resto se direcciona con `track` (índice de Arrange), no con el ordinal de la tira del Mixer.
+- Verifica siempre `mixer_window` y `mixer_window_title` en la respuesta: dicen qué superficie contestó de verdad.
+
 ### 2. Obtener la receta
 
 - Mezcla: pide al sound engineer `judge_mix` con los stems (rutas de archivos exportados).
@@ -43,7 +53,7 @@ Este skill es el adaptador: traduce la receta a llamadas de Logic, de forma hone
 |---|---|---|
 | `fader` (`target`: vocal, drums, bass...) | `logic_mixer`, volumen de la pista correspondiente | ✅ Verificable: lee el valor actual de `logic://mixer`, aplica el delta en dB, lee de vuelta |
 | `pan` | `logic_mixer`, pan | ✅ Verificable (la receta actual no lo emite) |
-| `eq.high_pass`, `eq.bell`, `eq.shelf` | Insertar el EQ stock con `logic_plugins.insert_verified` en un slot libre (`get_inventory` primero) | ⚠️ Inserción verificable; **freq/gain/Q no**: `set_param_verified` solo verifica `threshold` del Compressor |
+| `eq.high_pass`, `eq.bell`, `eq.shelf` | Insertar el EQ stock con `logic_plugins.insert_verified` en un slot libre (`get_inventory` primero, con `mixer_window:"detached"` — ver §1b) | ⚠️ Inserción verificable; **freq/gain/Q no**: `set_param_verified` solo verifica `threshold` del Compressor |
 | `compressor` | Insertar Compressor stock con `insert_verified` | ⚠️ `threshold` verificable; ratio/attack/release no |
 | `limiter` | Insertar Limiter stock con `insert_verified` | ⚠️ Inserción sí; `ceiling` no verificable |
 | `de_esser`, `dynamic_eq`, `stereo.width` | Plugin stock equivalente si existe | ❌ Sin mapeo verificado: propón al usuario hacerlo a mano |
