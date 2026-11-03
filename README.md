@@ -79,7 +79,7 @@ cd mcp_sound_engineer
 
 | Command | What it does |
 |---|---|
-| `./start-sound-engineer-mcp.sh` | HTTP bridge on `127.0.0.1:8766` (`POST /mcp`, `GET /health`) |
+| `./start-sound-engineer-mcp.sh` | HTTP bridge on `127.0.0.1:8766` (`POST /mcp`, `GET /health`; a JSON-RPC bridge, not the spec's Streamable HTTP transport) |
 | `./start-sound-engineer-mcp.sh --port 8770` | Same, another port |
 | `./start-sound-engineer-mcp.sh --stdio` | JSON-RPC over stdin/stdout (MCP clients that spawn it) |
 | `./start-sound-engineer-mcp.sh --status` / `--stop` / `--restart` | Lifecycle via `.run/engineer.pid` |

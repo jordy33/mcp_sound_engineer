@@ -67,6 +67,19 @@ def test_analyze_master():
     print("analyze_master ok:", facts["loudness"])
 
 
+def test_initialize_negotiates_a_supported_protocol_version():
+    """The server answers with a version it speaks, never an echoed client string."""
+    for requested in engineer_server.SUPPORTED_PROTOCOL_VERSIONS:
+        reply = engineer_server.handle({
+            "jsonrpc": "2.0", "id": 1, "method": "initialize",
+            "params": {"protocolVersion": requested}})
+        assert reply["result"]["protocolVersion"] == requested, reply
+    reply = engineer_server.handle({
+        "jsonrpc": "2.0", "id": 2, "method": "initialize",
+        "params": {"protocolVersion": "9999-99-99"}})
+    assert reply["result"]["protocolVersion"] in engineer_server.SUPPORTED_PROTOCOL_VERSIONS, reply
+
+
 def test_mcp_handshake():
     proc = subprocess.Popen([sys.executable, os.path.join(ROOT, "server", "engineer_server.py")],
                             stdin=subprocess.PIPE, stdout=subprocess.PIPE, text=True)
@@ -335,6 +348,11 @@ def test_http_rejects_foreign_host_origin_and_oversized_body():
         body = json.loads(health.read())
         conn.close()
         assert health.status == 200 and body["version"] == engineer_server.SERVER_VERSION, body
+
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("GET", "/not-a-route")
+        assert conn.getresponse().status == 404, "only /health is a GET resource"
+        conn.close()
 
         conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
         conn.request("GET", "/health", headers={"Host": "evil.example"})

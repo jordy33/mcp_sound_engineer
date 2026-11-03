@@ -22,6 +22,9 @@ except ImportError:  # executed as a script: python server/engineer_server.py
 
 SERVER_NAME = "mcp_sound_engineer"
 SERVER_VERSION = "0.9.1"
+# MCP versions this server speaks, newest first. `initialize` answers with one of
+# these; echoing whatever the client sent would claim support we do not have.
+SUPPORTED_PROTOCOL_VERSIONS = ("2025-03-26", "2024-11-05")
 MAX_BODY_BYTES = 8 * 1024 * 1024
 LOOPBACK_HOSTS = {"127.0.0.1", "localhost", "::1"}
 
@@ -326,12 +329,13 @@ def handle(msg: dict) -> dict | None:
     if notification:
         return None
     if method == "initialize":
+        requested = params.get("protocolVersion")
+        version = (requested if requested in SUPPORTED_PROTOCOL_VERSIONS
+                   else SUPPORTED_PROTOCOL_VERSIONS[0])
         return make_result(rid, {
-            "protocolVersion": params.get("protocolVersion", "2024-11-05"),
+            "protocolVersion": version,
             "capabilities": {"tools": {}},
             "serverInfo": {"name": SERVER_NAME, "version": SERVER_VERSION}})
-    if method == "notifications/initialized":
-        return None
     if method == "ping":
         return make_result(rid, {})
     if method == "tools/list":
@@ -425,7 +429,10 @@ def serve_http(port: int = 8766) -> None:
             if self.path == "/health":
                 self._send(200, {"status": "ok", "server": SERVER_NAME, "version": SERVER_VERSION})
             else:
-                self._send(200, {"server": SERVER_NAME, "mcp": "POST /mcp", "health": "/health"})
+                # This is a JSON-RPC bridge, not a web page: only /health is a
+                # resource. Answering every path with 200 hides typos and makes
+                # the bridge look like a Streamable HTTP endpoint it is not.
+                self._send(404, {"error": "not found", "mcp": "POST /mcp", "health": "/health"})
 
         def do_POST(self):  # noqa: N802
             if not self._guard():

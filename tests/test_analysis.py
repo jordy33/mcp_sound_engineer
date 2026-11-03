@@ -71,6 +71,31 @@ def _wav_float(samples: np.ndarray, sr: int = SR, bits: int = 32,
     return path
 
 
+def _wav_extensible_pcm24(samples: np.ndarray, sr: int = SR) -> str:
+    """Write WAVE_FORMAT_EXTENSIBLE PCM24, the container some Pythons' wave rejects."""
+    path = os.path.join(tempfile.mkdtemp(), "text24.wav")
+    data = np.atleast_2d(samples.T).T if samples.ndim > 1 else samples.reshape(-1, 1)
+    values = (np.clip(data, -1, 1) * 8388607).astype(np.int32)
+    raw = np.stack([values & 0xFF, (values >> 8) & 0xFF, (values >> 16) & 0xFF],
+                   axis=-1).astype(np.uint8).tobytes()
+    channels = data.shape[1]
+    block = channels * 3
+    guid = struct.pack("<IHH", 1, 0, 0x0010) + b"\x80\x00\x00\xAA\x00\x38\x9B\x71"
+    fmt = struct.pack("<HHIIHH", 0xFFFE, channels, sr, sr * block, block, 24)
+    fmt += struct.pack("<HHI", 22, 24, 0) + guid           # cbSize, valid bits, mask
+    with open(path, "wb") as handle:
+        handle.write(b"RIFF")
+        handle.write(struct.pack("<I", 20 + len(fmt) + len(raw)))
+        handle.write(b"WAVE")
+        handle.write(b"fmt ")
+        handle.write(struct.pack("<I", len(fmt)))
+        handle.write(fmt)
+        handle.write(b"data")
+        handle.write(struct.pack("<I", len(raw)))
+        handle.write(raw)
+    return path
+
+
 def _sine(freq, amp, seconds=3.0, sr=SR):
     t = np.arange(int(seconds * sr)) / sr
     return (amp * np.sin(2 * np.pi * freq * t)).astype(np.float64)
@@ -151,6 +176,23 @@ def test_24_bit_wav_is_read_at_the_right_level():
     facts = analysis.analyze_master(path)
     assert facts["bit_depth"] == 24
     assert abs(facts["loudness"]["sample_peak_dbfs"] - (-6.02)) < 0.1, facts["loudness"]
+
+
+def test_extensible_pcm_wav_does_not_require_soundfile():
+    """WAVE_FORMAT_EXTENSIBLE PCM must decode when wave rejects the container."""
+    path = _wav_extensible_pcm24(_sine(1000, 0.5, seconds=1.0))
+    original = analysis.wave.open
+
+    def refuse(*args, **kwargs):
+        raise wave.Error("unknown format: 65534")
+
+    analysis.wave.open = refuse
+    try:
+        data, sr = analysis.load(path)
+    finally:
+        analysis.wave.open = original
+    assert sr == SR and data.shape == (SR, 1), (sr, data.shape)
+    assert abs(float(np.max(np.abs(data))) - 0.5) < 0.01
 
 
 def test_mono_cancel_is_reported():
@@ -268,6 +310,13 @@ def test_low_band_correlation_ignores_highs():
     stereo = np.stack([bass + high, bass - high], axis=1)   # mono lows, inverted highs
     assert analysis.low_band_correlation(stereo, SR) > 0.99
     assert analysis.analyze_master(_wav(stereo))["stereo"]["phase_correlation"] < 0.5
+
+
+def test_band_correlation_is_not_changed_by_a_dc_offset():
+    """Pearson subtracts the mean; a DC offset is not a stereo relationship."""
+    tone = _sine(440, 0.2)
+    stereo = np.stack([tone, tone], axis=1)
+    assert analysis.band_correlation(stereo, SR) == analysis.band_correlation(stereo + 0.5, SR)
 
 
 def test_stem_gate_vocal_buried():
@@ -549,6 +598,16 @@ def test_flat_top_at_minus_one_dbfs_is_not_sample_clipping():
     assert facts["flat_top_frames"] > 1000, facts
 
 
+def test_square_wave_is_not_mistaken_for_a_clipped_ceiling():
+    """A pulse wave's flat top jumps to the opposite rail; clipping returns to zero."""
+    t = np.arange(SR * 2) / SR
+    square = np.where(np.sin(2 * np.pi * 100 * t) >= 0, 0.5, -0.5)
+    facts = analysis.clipping(square)
+    assert facts["flat_top_frames"] == 0, facts
+    clipped = np.clip(1.2 * np.sin(2 * np.pi * 100 * t), -0.891, 0.891)
+    assert analysis.clipping(clipped)["flat_top_frames"] > 1000
+
+
 def test_measured_cutoff_reports_the_edge_and_full_band_is_none():
     rng = np.random.default_rng(7)
     full = rng.normal(size=SR * 10)
@@ -580,6 +639,27 @@ def test_temporal_overlap_separates_never_from_always_coactive():
     always = analysis.analyze_stems([_wav(tone), _wav(tone)])["band_overlap_pairs"][0]
     assert never["band_overlap_db"] is None and never["coactive_fraction"] == 0.0, never
     assert always["coactive_fraction"] > 0.9 and always["dominant_band"] == "mid", always
+
+
+def test_quiet_stem_is_not_a_full_collision():
+    """A hi-hat 30 dB under a pad keeps its band, but not its level."""
+    rng = np.random.default_rng(11)
+    n = SR * 6
+    pad = 0.2 * rng.normal(size=n)
+    freqs = np.fft.rfftfreq(n, 1 / SR)
+    spec = np.fft.rfft(rng.normal(size=n))
+    spec[freqs < 4000] = 0
+    hat = np.fft.irfft(spec, n=n)
+    hat = 0.006 * hat / np.max(np.abs(hat))
+    quiet = analysis.analyze_stems([
+        _wav(pad, name="pad.wav"), _wav(hat, name="hat.wav"),
+    ])["band_overlap_pairs"][0]
+    equal = analysis.analyze_stems([
+        _wav(pad, name="pad.wav"), _wav(pad, name="pad2.wav"),
+    ])["band_overlap_pairs"][0]
+    assert equal["dominant_band_overlap_db"] > -15.0, equal
+    assert (equal["dominant_band_overlap_db"]
+            - quiet["dominant_band_overlap_db"]) > 20.0, (quiet, equal)
 
 
 def test_reference_measurement_is_idempotent():

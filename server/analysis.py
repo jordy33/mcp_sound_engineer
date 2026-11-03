@@ -88,16 +88,19 @@ def _wav_fmt(path: str) -> tuple[int, int, int] | None:
                     bits = int.from_bytes(body[14:16], "little")
                     if code == 0xFFFE and len(body) >= 26:
                         subtype = int.from_bytes(body[24:26], "little")
-                        if subtype == 3:
-                            code = 3                     # WAVE_FORMAT_IEEE_FLOAT
+                        if subtype in (1, 3):
+                            # 1 = PCM, 3 = IEEE float. Normalize so `load` can
+                            # route float to its own decoder and PCM through
+                            # `wave`, with our own decoder as the fallback.
+                            code = subtype
                     return code, channels, bits
                 handle.seek(size + (size & 1), 1)
     except OSError:
         return None
 
 
-def _read_float_wav(path: str) -> tuple[np.ndarray, int]:
-    """Decode an IEEE-float WAV without relying on `wave` accepting it."""
+def _read_wav_chunks(path: str) -> tuple[bytes | None, bytes | None]:
+    """Return the `fmt ` and `data` chunk bodies of a RIFF/WAVE file."""
     with open(path, "rb") as handle:
         header = handle.read(12)
         if (len(header) < 12 or header[:4] != b"RIFF"
@@ -120,6 +123,31 @@ def _read_float_wav(path: str) -> tuple[np.ndarray, int]:
                 break
             else:
                 handle.seek(size + (size & 1), 1)
+    return fmt, raw
+
+
+def _decode_pcm(raw: bytes, width: int, channels: int) -> np.ndarray:
+    """Decode interleaved integer PCM into (frames, channels) float32."""
+    if width == 2:
+        x = np.frombuffer(raw, "<i2").astype(np.float32) / 32768.0
+    elif width == 3:
+        b = np.frombuffer(raw, np.uint8).reshape(-1, 3).astype(np.int32)
+        v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
+        v = np.where(v & 0x800000, v - 0x1000000, v)
+        x = v.astype(np.float32) / 8388608.0
+    elif width == 4:
+        x = np.frombuffer(raw, "<i4").astype(np.float32) / 2147483648.0
+    elif width == 1:
+        x = (np.frombuffer(raw, np.uint8).astype(np.float32) - 128.0) / 128.0
+    else:
+        raise ValueError(f"unsupported WAV sample width: {width} bytes")
+    frames = x.size // channels
+    return x[:frames * channels].reshape(-1, channels)
+
+
+def _read_float_wav(path: str) -> tuple[np.ndarray, int]:
+    """Decode an IEEE-float WAV without relying on `wave` accepting it."""
+    fmt, raw = _read_wav_chunks(path)
     if fmt is None or raw is None or len(fmt) < 16:
         raise ValueError(f"{path}: malformed float WAV")
     channels = int.from_bytes(fmt[2:4], "little")
@@ -132,6 +160,24 @@ def _read_float_wav(path: str) -> tuple[np.ndarray, int]:
     frames = samples.size // channels
     samples = samples[:frames * channels].reshape(-1, channels).astype(np.float32)
     return samples, sr
+
+
+def _read_pcm_wav(path: str) -> tuple[np.ndarray, int]:
+    """Decode integer PCM ourselves.
+
+    WAVE_FORMAT_EXTENSIBLE PCM is a plain PCM payload in a container that older
+    `wave` modules reject. Falling straight through to soundfile would make an
+    optional dependency mandatory for a Logic bounce; decode it here instead.
+    """
+    fmt, raw = _read_wav_chunks(path)
+    if fmt is None or raw is None or len(fmt) < 16:
+        raise ValueError(f"{path}: malformed PCM WAV")
+    channels = int.from_bytes(fmt[2:4], "little")
+    sr = int.from_bytes(fmt[4:8], "little")
+    bits = int.from_bytes(fmt[14:16], "little")
+    if channels <= 0 or bits not in (8, 16, 24, 32):
+        raise ValueError(f"{path}: unsupported PCM WAV ({bits}-bit, {channels} channels)")
+    return _decode_pcm(raw, bits // 8, channels), sr
 
 
 def _validate_samples(x: np.ndarray, path: str) -> np.ndarray:
@@ -165,21 +211,18 @@ def load(path: str) -> tuple[np.ndarray, int]:
                                     w.getnframes(), w.getsampwidth())
                 raw = w.readframes(n)
         except (wave.Error, EOFError):
-            return _load_via_soundfile(path)
-        if width == 2:
-            x = np.frombuffer(raw, "<i2").astype(np.float32) / 32768.0
-        elif width == 3:
-            b = np.frombuffer(raw, np.uint8).reshape(-1, 3).astype(np.int32)
-            v = b[:, 0] | (b[:, 1] << 8) | (b[:, 2] << 16)
-            v = np.where(v & 0x800000, v - 0x1000000, v)
-            x = v.astype(np.float32) / 8388608.0
-        elif width == 4:
-            x = np.frombuffer(raw, "<i4").astype(np.float32) / 2147483648.0
-        elif width == 1:
-            x = (np.frombuffer(raw, np.uint8).astype(np.float32) - 128.0) / 128.0
-        else:
-            raise ValueError(f"unsupported WAV sample width: {width} bytes")
-        x = x.reshape(-1, ch)
+            # Only integer PCM has a payload we can decode ourselves. A
+            # compressed codec must still go to soundfile, never be reinterpreted
+            # as PCM.
+            if fmt is None or fmt[0] != 1:
+                return _load_via_soundfile(path)
+            try:
+                x, sr = _read_pcm_wav(path)
+            except (OSError, ValueError):
+                return _load_via_soundfile(path)
+            channel_layout(x.shape[1])
+            return _validate_samples(x, path), sr
+        x = _decode_pcm(raw, width, ch)
         channel_layout(ch)
         return _validate_samples(x, path), sr
 
@@ -478,6 +521,11 @@ def _flat_top_frames(data: np.ndarray, min_run: int = 3, tolerance: float = 1e-7
     A limiter that clips at -1 dBFS never reaches the 0.999 threshold, but the
     repeated sample values are still a hard ceiling and audible distortion.
     Runs are found per channel and unioned at frame level.
+
+    A run only counts when the samples flanking it keep its sign. A clipped crest
+    returns toward zero, so both neighbours stay on the same side; a square or
+    pulse wave jumps straight to the opposite rail. That transition is the
+    waveform's deliberate shape, not a ceiling, and must not send the mix back.
     """
     x = np.atleast_2d(data) if data.ndim > 1 else data.reshape(-1, 1)
     if x.shape[0] < min_run:
@@ -489,10 +537,15 @@ def _flat_top_frames(data: np.ndarray, min_run: int = 3, tolerance: float = 1e-7
             continue
         same = np.abs(np.diff(column)) <= tolerance
         starts = np.concatenate(([True], ~same))
+        start_index = np.flatnonzero(starts)
         run_id = np.cumsum(starts) - 1
         run_len = np.bincount(run_id)
-        qualifies = run_len >= min_run
-        qualifies &= np.abs(column[starts]) >= floor
+        run_value = column[start_index]
+        before = column[np.maximum(start_index - 1, 0)]
+        after = column[np.minimum(start_index + run_len, column.size - 1)]
+        sign = np.sign(run_value)
+        continuous = (np.sign(before) == sign) & (np.sign(after) == sign)
+        qualifies = (run_len >= min_run) & (np.abs(run_value) >= floor) & continuous
         flagged |= qualifies[run_id]
     return int(flagged.sum())
 
@@ -661,28 +714,37 @@ def _centroid(data, sr: int) -> int:
     return int(float((freqs * psd).sum() / (psd.sum() + 1e-12)))
 
 
-def _band_correlation(l: np.ndarray, r: np.ndarray, sr: int,
-                      lo: float, hi: float) -> float | None:
+def _band_correlation(spec_l: np.ndarray, spec_r: np.ndarray,
+                      freqs: np.ndarray, lo: float, hi: float) -> float | None:
     """L/R correlation inside one band, or None when that band is nearly empty.
 
     A global correlation is dominated by the loudest band; a mono bass under wide
     highs can read healthy. The energy guard is relative (-30 dB), not absolute.
+
+    Taken from one pair of spectra instead of an inverse FFT per band: the
+    zero-lag Pearson correlation of a mask-filtered signal is just the masked
+    cross-spectrum over the masked powers (Parseval). DC is excluded because
+    Pearson already subtracts the mean.
     """
-    spec_l, spec_r = np.fft.rfft(l), np.fft.rfft(r)
-    freqs = np.fft.rfftfreq(len(l), 1 / sr)
     mask = (freqs >= lo) & (freqs < hi)
     if not mask.any():
         return None
-    low_power = float(np.sum(np.abs(spec_l[mask]) ** 2) + np.sum(np.abs(spec_r[mask]) ** 2))
+    band_power = float(np.sum(np.abs(spec_l[mask]) ** 2)
+                       + np.sum(np.abs(spec_r[mask]) ** 2))
     total_power = float(np.sum(np.abs(spec_l) ** 2) + np.sum(np.abs(spec_r) ** 2))
-    if total_power <= 1e-20 or low_power < total_power * 1e-3:
+    if total_power <= 1e-20 or band_power < total_power * 1e-3:
         return None
-    band_l = np.fft.irfft(spec_l * mask, n=len(l))
-    band_r = np.fft.irfft(spec_r * mask, n=len(r))
-    denom = np.std(band_l) * np.std(band_r)
-    if denom < 1e-9:
+    correlation_mask = mask.copy()
+    correlation_mask[0] = False
+    if not correlation_mask.any():
         return None
-    return round(float(np.corrcoef(band_l, band_r)[0, 1]), 3)
+    power_l = float(np.sum(np.abs(spec_l[correlation_mask]) ** 2))
+    power_r = float(np.sum(np.abs(spec_r[correlation_mask]) ** 2))
+    if power_l <= 1e-20 or power_r <= 1e-20:
+        return None
+    numerator = float(np.sum(
+        (spec_l[correlation_mask] * np.conj(spec_r[correlation_mask])).real))
+    return round(float(numerator / np.sqrt(power_l * power_r)), 3)
 
 
 def low_band_correlation(stereo: np.ndarray, sr: int, cutoff_hz: float = 120.0):
@@ -692,14 +754,22 @@ def low_band_correlation(stereo: np.ndarray, sr: int, cutoff_hz: float = 120.0):
     """
     if stereo.ndim != 2 or stereo.shape[1] < 2:
         return None
-    return _band_correlation(stereo[:, 0], stereo[:, 1], sr, 0.0, cutoff_hz)
+    left = stereo[:, 0].astype(np.float64, copy=False)
+    right = stereo[:, 1].astype(np.float64, copy=False)
+    spec_l, spec_r = np.fft.rfft(left), np.fft.rfft(right)
+    freqs = np.fft.rfftfreq(len(left), 1 / sr)
+    return _band_correlation(spec_l, spec_r, freqs, 0.0, cutoff_hz)
 
 
 def band_correlation(stereo: np.ndarray, sr: int) -> dict:
     """Per-band L/R correlation; informative, and `None` per empty band."""
     if stereo.ndim != 2 or stereo.shape[1] < 2:
         return {band: None for band in BANDS}
-    return {band: _band_correlation(stereo[:, 0], stereo[:, 1], sr, lo, hi)
+    left = stereo[:, 0].astype(np.float64, copy=False)
+    right = stereo[:, 1].astype(np.float64, copy=False)
+    spec_l, spec_r = np.fft.rfft(left), np.fft.rfft(right)
+    freqs = np.fft.rfftfreq(len(left), 1 / sr)
+    return {band: _band_correlation(spec_l, spec_r, freqs, lo, hi)
             for band, (lo, hi) in BANDS.items()}
 
 
@@ -800,7 +870,7 @@ def _window_band_powers(data: np.ndarray, sr: int, window_s: float = 1.0,
         bands = {name: float(10 * np.log10(
             float(psd[(freqs >= lo) & (freqs < hi)].sum()) / total + 1e-12))
             for name, (lo, hi) in BANDS.items()}
-        rows.append({"rms": rms, "bands": bands})
+        rows.append({"rms": rms, "total": total, "bands": bands})
     return rows
 
 
@@ -811,6 +881,11 @@ def _temporal_overlap(a: dict, b: dict) -> dict:
     they never sound together. `band_overlap_db` is time-weighted by the fraction
     of windows in which both are active, so a rare collision does not score like
     a constant one.
+
+    Each stem's band balance is relative to its own energy, so a ghost hi-hat
+    30 dB under a pad would otherwise read as a full collision. The shared band
+    is expressed relative to the louder stem's broadband level: a quiet element
+    can only crowd what its absolute level actually reaches.
     """
     rows_a, rows_b = a.get("windows"), b.get("windows")
     if not rows_a or not rows_b or a.get("sr") != b.get("sr"):
@@ -835,10 +910,16 @@ def _temporal_overlap(a: dict, b: dict) -> dict:
                 "note": "the stems never sound together in the same 1 s window"}
     shared = {}
     for band in BANDS:
-        powers = [10 ** (min(rows_a[i]["bands"][band], rows_b[i]["bands"][band]) / 10)
-                  for i in coactive]
+        ratios = []
+        for i in coactive:
+            total_a, total_b = rows_a[i]["total"], rows_b[i]["total"]
+            band_a = total_a * 10 ** (rows_a[i]["bands"][band] / 10)
+            band_b = total_b * 10 ** (rows_b[i]["bands"][band] / 10)
+            # The quieter stem's absolute band, relative to the louder stem's
+            # total. With equal levels this is exactly min(rel_a, rel_b).
+            ratios.append(min(band_a, band_b) / max(total_a, total_b))
         # Time-weighted: the same collision present 5 % of the time is 13 dB rarer.
-        shared[band] = 10 * np.log10(float(np.mean(powers)) * fraction + 1e-12)
+        shared[band] = 10 * np.log10(float(np.mean(ratios)) * fraction + 1e-12)
     overlap = float(sum(shared.values()) / len(shared))
     dominant = max(shared, key=shared.get)
     return {"band_overlap_db": round(overlap, 2), "dominant_band": dominant,
@@ -882,7 +963,8 @@ def analyze_stems(paths: list[str]) -> dict:
     return plain({"stems": stems,
                   "band_overlap_pairs": overlap_pairs[:5],
                   "band_overlap_note": "time-weighted mean per-band minimum while both "
-                                       "stems are active (> max -40 dB); a crowding proxy, "
+                                       "stems are active (> max -40 dB), relative to the "
+                                       "louder stem's broadband level; a crowding proxy, "
                                        "not perceptual masking",
                   "gates": stem_gates(stems)})
 
