@@ -11,3 +11,6 @@ renders/
 .env
 .run/
 *.egg-info/
+conductor/
+fix.md
+tests/test_calibrate_fader.py

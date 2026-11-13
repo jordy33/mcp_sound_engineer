@@ -6,6 +6,7 @@ executable, DAW-neutral recipe. Applying it is another server's job.
 """
 from __future__ import annotations
 
+import errno
 import json
 import os
 import sys
@@ -77,8 +78,13 @@ def tool_validate_recipe(recipe: list) -> dict:
 def _stem_fact_map(paths: list[str] | None) -> dict:
     if not paths:
         return {}
-    return {os.path.splitext(os.path.basename(stem["path"]))[0]: stem
-            for stem in analyze_stems(paths)["stems"]}
+    out: dict[str, dict] = {}
+    for stem in analyze_stems(paths)["stems"]:
+        base = os.path.splitext(os.path.basename(stem["path"]))[0]
+        if base in out:
+            raise ValueError(f"duplicate stem basename {base!r}: stem basenames must be unique")
+        out[base] = stem
+    return out
 
 
 def tool_verify_recipe(recipe: list, before_path: str, after_path: str,
@@ -107,6 +113,11 @@ def tool_judge_master(path: str, platform: str = "spotify",
                       reference_path: str | None = None,
                       previous_path: str | None = None,
                       desired_lufs: float | None = None) -> dict:
+    if desired_lufs is not None:
+        validated_lufs = rules._number(desired_lufs)
+        if validated_lufs is None:
+            raise ValueError("desired_lufs must be a finite number")
+        desired_lufs = validated_lufs
     facts = analyze_master(path)
     target = rules.loudness_target(platform)
     reference_source = "measured" if reference_path else "generic_default"
@@ -179,6 +190,35 @@ def tool_judge_master(path: str, platform: str = "spotify",
             "warnings": warnings}
 
 
+def _format_gate_warning(gate: dict) -> str:
+    name = gate.get("gate") or "gate"
+    stem = gate.get("stem")
+    if name == "mono_bass":
+        corr = gate.get("low_correlation")
+        stem_str = f"{stem}: " if stem else ""
+        corr_str = f" ({corr})" if corr is not None else ""
+        return (f"{stem_str}low-band phase correlation{corr_str} is below 0.3; "
+                f"collapse low frequencies to mono to avoid cancellation")
+    if name == "vocal_buried":
+        relative = gate.get("relative_db")
+        loss = f"{abs(relative):g} LU" if relative is not None else "too many LU"
+        return (f"the vocal stems sit {loss} below the rest of the mix; raise the "
+                f"vocal bus or lower the competing element — no EQ bell was planned")
+    if name == "single_element_peak":
+        excess = gate.get("excess_db")
+        over = f"{excess:g} LU" if excess is not None else "much"
+        return (f"{stem or 'stem'} sits {over} above the median stem; lower or "
+                f"automate that element instead of compressing the whole mix")
+    details = []
+    if stem:
+        details.append(f"stem {stem}")
+    for k, v in sorted(gate.items()):
+        if k not in ("gate", "stem"):
+            details.append(f"{k} {v}")
+    body = "; ".join(details) if details else "triggered"
+    return f"gate {name}: {body}"
+
+
 def tool_judge_mix(paths: list[str]) -> dict:
     facts = analyze_stems(paths)
     state = {"context": {"stage": "mixing"}, "facts": _jev_facts(facts),
@@ -198,7 +238,7 @@ def tool_judge_mix(paths: list[str]) -> dict:
         if confidence["unknown"]:
             parts.append(f"no confidence reported for {confidence['unknown']}")
         warnings.append("; ".join(parts) + "; treat the recipe as a draft")
-    warnings += [f"{g['gate']}: {g}" for g in gates if g.get("gate") not in explained]
+    warnings += [_format_gate_warning(g) for g in gates if g.get("gate") not in explained]
     return {"facts": facts, "answers": answers,
             "recipe": rules.build_mix_recipe(answers, names, facts["stems"], overlap_pairs),
             "confidence": confidence,
@@ -463,7 +503,10 @@ def serve_http(port: int = 8766) -> None:
     try:
         srv = ThreadingHTTPServer(("127.0.0.1", port), Handler)
     except OSError as exc:
-        if getattr(exc, "errno", None) == 48:
+        addrinuse = {errno.EADDRINUSE}
+        if hasattr(errno, "WSAEADDRINUSE"):
+            addrinuse.add(errno.WSAEADDRINUSE)
+        if getattr(exc, "errno", None) in addrinuse:
             print(f"[engineer] port {port} is already in use.", flush=True)
             print("[engineer]   stop it:  ./start-sound-engineer-mcp.sh --stop", flush=True)
             print(f"[engineer]   or use:   ./start-sound-engineer-mcp.sh --port {port + 1}", flush=True)

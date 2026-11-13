@@ -453,17 +453,20 @@ class InventoryFile:
                 raise ValueError("inventory entry %r must be a JSON object" % key)
         return cls(responses=dict(data), single=False)
 
-    def response_for(self, keys, single_target: bool = False):
+    def _match(self, keys, single_target: bool = False):
         for key in keys:
             if key in self.responses:
-                return self.responses[key]
-        if self.single and single_target:
-            return self.responses.get("*")
-        return None
+                return key, self.responses[key]
+        if self.single and single_target and "*" in self.responses:
+            return "*", self.responses["*"]
+        return None, None
+
+    def response_for(self, keys, single_target: bool = False):
+        _, raw = self._match(keys, single_target=single_target)
+        return raw
 
     def chain_for(self, keys, single_target: bool = False, selector=None):
-        key = next(iter(keys), "") if keys else ""
-        raw = self.response_for(keys, single_target=single_target)
+        matched_key, raw = self._match(keys, single_target=single_target)
         if raw is None:
             return None
-        return parse_inventory(raw, key=key, selector=selector)
+        return parse_inventory(raw, key=matched_key or "", selector=selector)

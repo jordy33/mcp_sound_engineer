@@ -53,7 +53,7 @@ A recipe is an ordered array of actions. Order matters: it is the signal chain.
 | `de_esser` | `freq_hz` ~5–9 k, `ratio` |
 | `stereo.width` | `mono_below_hz`, `width_db` ≤ 2 |
 | `limiter` | `ceiling_dbtp` ≤ −1.0, `input_gain_db` ≥ −3, `expected_gain_reduction_db` ≤ 4, optional `desired_lufs`, informational `loudness_reached` / `approx_lufs_after` / `plr_db` |
-| `fader` | `target`, `gain_db` (mixing, ≤ ±3), `stem` for a per-stem move |
+| `fader` | `target`, `gain_db` (mixing, relative delta ≤ ±3), `stem` for a per-stem move; resolved against current mixer level at apply time |
 | `pan` | `target`, `position` −1..1 |
 | `dither` | `bit_depth` 16 or 24, `type` (`tpdf`) — only for fixed-bit destinations |
 | `send_back` | `reasons` (array of measured causes, or `unmeasured:<field>`) — terminal |

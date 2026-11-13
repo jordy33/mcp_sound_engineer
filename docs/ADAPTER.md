@@ -45,7 +45,7 @@ Addressing rules:
 
 | Action | Status | `mcp_logic` call | Notes |
 |---|---|---|---|
-| `fader` | `needs_calibration` → `ready` | `logic_mixer.set_volume` | contract 0..1 with a measured taper, not dB |
+| `fader` | `needs_calibration` → `ready` | `logic_mixer.set_volume` | relative delta (`gain_db`) resolved against current `logic://mixer` level at apply time; maps `target_db` to contract 0..1 with measured taper |
 | `pan` | `ready` | `logic_mixer.set_pan` | |
 | `eq.bell` | `ready` | `logic_plugins.insert_verified` (Channel EQ) + `logic_plugins.set_eq_band_verified` ×3 | once per target; `Frequency`/Hz, `Gain`/dB, `Q`/Q |
 | `eq.shelf` | `ready` | insert + `set_eq_band_verified` ×2–3 | `Frequency`/`Gain` (+ `Q` when present) on Low/High Shelf; sign preserved |

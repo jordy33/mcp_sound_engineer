@@ -902,6 +902,26 @@ def test_bounce_settings_must_not_change_between_runs():
         _cleanup(root)
 
 
+def test_bounce_settings_must_not_change_between_runs_with_external_baseline():
+    root = _tempdir()
+    before = os.path.join(root, "before.wav")
+    with open(before, "wb") as handle:
+        handle.write(b"external-baseline")
+    try:
+        bridge = FakeBridge(
+            settings_sequence=[
+                {"format": "wav", "bit_depth": 24, "sample_rate": 44100},
+                {"format": "wav", "bit_depth": 16, "sample_rate": 44100},
+            ],
+            comparisons=[_bands(-1.0, 800)])
+        report = _run(root, [_bell()], bridge, before=before, trust_before=True,
+                      tolerance_db=0.75)
+        _assert_ok(report, "bounce_settings_changed", 1)
+        assert len(report["iterations"]) == 1
+    finally:
+        _cleanup(root)
+
+
 def test_clipping_guardrail_stops_after_the_export():
     root = _tempdir()
     try:

@@ -166,9 +166,8 @@ CONFIDENCE_MIN = 0.5
 SCORE_MIN = 2.0
 SCORE_MAX = 10.0
 
-# PRODUCT RULE: masking at or below this score needs no corrective bell; above it
-# the requested cut grows 1:1 with the score, capped by GATE.
-MASKING_SCORE_BASE = 2.0
+# PRODUCT RULE: masking at or below MASKING_SCORE_THRESHOLD needs no corrective bell;
+# above it the requested cut is mapped onto the corrective range, capped by GATE.
 MASKING_SCORE_THRESHOLD = 2.5
 # Only a shared mid/high band can be treated with a bus bell. A pair whose only
 # overlap is sub/bass needs faders or a high-pass, not a 300 Hz bus cut.
@@ -234,6 +233,8 @@ def require(answers: dict, questions: dict) -> None:
                 raise ValueError(f"{name}.choice must be one of {sorted(criteria)}, "
                                  f"got {answer.get('choice')!r}")
     for name, answer in answers.items():
+        if not isinstance(answer, dict):
+            raise ValueError(f"{name} must be an object, got {type(answer).__name__}")
         # `noul` and `confidence` ride alongside the typed answer; validate them
         # whenever they are present, but do not require them.
         for field in ("noul", "confidence"):
@@ -436,9 +437,10 @@ def evaluate_gates(facts: dict) -> dict:
 
     A gate whose input is absent is NOT treated as healthy: the missing field is
     reported as `unmeasured:<field>` and the result is a refusal. There is no
-    "default to a safe-looking number" path. The one exception is
-    `noise.floor_dbfs: null`, which is itself a measurement: it means the file
-    has no silence in which to measure a floor.
+    "default to a safe-looking number" path. The two exceptions are
+    `noise.floor_dbfs: null` (meaning the file has no silence in which to measure
+    a floor) and `loudness.loudness_range_lu: null` (meaning the file is shorter
+    than one 3 s window, so the range is unmeasurable rather than zero).
 
     The decision model is deliberately NOT asked whether to refuse: a global yes/no
     duplicates the detailed scores and contradicts them when they disagree.
@@ -515,14 +517,21 @@ def evaluate_gates(facts: dict) -> dict:
             reasons.append("lossy_source:measured")
 
     # PRODUCT RULE (not in the source): a finished master cannot be mastered again.
-    lra = _number(loud.get("loudness_range_lu"))
+    lra = None
+    if "loudness_range_lu" not in loud:
+        unmeasured.append("loudness.loudness_range_lu")
+    elif loud.get("loudness_range_lu") is not None:
+        lra = _number(loud.get("loudness_range_lu"))
+        if lra is None:
+            unmeasured.append("loudness.loudness_range_lu")
+
     true_peak = _number(loud.get("true_peak_dbtp"))
     integrated = _number(loud.get("integrated_lufs"))
-    for field, value in (("loudness_range_lu", lra),
-                         ("true_peak_dbtp", true_peak),
-                         ("integrated_lufs", integrated)):
-        if value is None:
-            unmeasured.append("loudness." + field)
+    if true_peak is None:
+        unmeasured.append("loudness.true_peak_dbtp")
+    if integrated is None:
+        unmeasured.append("loudness.integrated_lufs")
+
     if (lra is not None and true_peak is not None and integrated is not None
             and lra < MAX_LRA_FINISHED and true_peak > -1.0 and integrated > -12.0):
         reasons.append("already_mastered:measured")
@@ -538,19 +547,21 @@ def evaluate_gates(facts: dict) -> dict:
 def loudness_warnings(facts: dict, target: dict) -> list[str]:
     out: list[str] = []
     loud = facts.get("loudness") or {}
-    lufs = float(loud.get("integrated_lufs", -99.0))
-    tp = float(loud.get("true_peak_dbtp", -99.0))
+    lufs_val = _number(loud.get("integrated_lufs"))
+    lufs = -99.0 if lufs_val is None else lufs_val
+    tp_val = _number(loud.get("true_peak_dbtp"))
+    tp = -99.0 if tp_val is None else tp_val
     ceiling = target["true_peak_ceiling"]
     if tp > ceiling + 0.05:
         out.append(f"true peak {tp} dBTP is above the {ceiling} dBTP ceiling for this destination")
     stereo = facts.get("stereo") or {}
-    cancel = stereo.get("mono_cancel_db")
-    if cancel is not None and float(cancel) < GATE["min_mono_cancel_db"]:
+    cancel = _number(stereo.get("mono_cancel_db"))
+    if cancel is not None and cancel < GATE["min_mono_cancel_db"]:
         out.append(f"mono fold-down loses {abs(cancel)} dB; check phase before the chain")
-    floor = (facts.get("noise") or {}).get("floor_dbfs")
-    if floor is not None and GATE["noise_floor_minor_db"] < float(floor) <= GATE["noise_floor_moderate_db"]:
+    floor = _number((facts.get("noise") or {}).get("floor_dbfs"))
+    if floor is not None and GATE["noise_floor_minor_db"] < floor <= GATE["noise_floor_moderate_db"]:
         out.append(f"noise floor {floor} dBFS is minor but audible on quiet passages")
-    ref = target.get("normalization_lufs")
+    ref = _number(target.get("normalization_lufs"))
     if ref is not None and lufs > ref + 6:
         out.append(f"{round(lufs - ref, 1)} dB hotter than the {ref} LUFS playback reference — "
                    f"the service will turn it down, so those extra dB buy nothing and cost dynamics")
@@ -1048,14 +1059,13 @@ def build_mix_recipe(answers: dict, stems: list[str],
     # Every label names the problem, so every correction lowers the offender.
     moves = {"vocal_too_high": ("vocal", -2.0), "drums_too_loud": ("drums", -2.0),
              "bass_too_heavy": ("bass", -2.0)}
+    balance_move = None
     if balance in moves:
         target, gain = moves[balance]
         stem = _match_stem(stems, target)
         if stem:
-            move = clamp(gain, -3.0, 3.0)
-            recipe.append(_action("fader", target=target, gain_db=move, stem=stem,
-                                  expect=_expect_delta("stem.integrated_lufs", move,
-                                                       1.0, stem=stem)))
+            balance_move = {"target": target, "gain": clamp(gain, -3.0, 3.0), "stem": stem}
+
     plan = _masking_plan(answers, stem_facts, overlap_pairs)
     if plan and plan["status"] == "measured":
         # Over-cap requests are capped, and mix_warnings names the cap so the
@@ -1068,18 +1078,41 @@ def build_mix_recipe(answers: dict, stems: list[str],
                                   f"spectral.bands_db_rel.{plan['band']}",
                                   -plan["cut_db"], 1.5)))
     # Gain staging is arithmetic, not taste: bring every stem toward -18 LUFS.
+    # When a balance move targets a stem, fold it into that stem's gain-staging computation
+    # so each stem receives at most one fader action with one consistent expect delta.
+    balance_applied = False
     for stem in stem_facts or []:
         lufs = _number(stem.get("integrated_lufs"))
         if lufs is None:
             continue   # unmeasured, not a healthy -18 LUFS
-        move = clamp(GAIN_STAGING_TARGET_LUFS - lufs, -GAIN_STAGING_MAX_MOVE_DB,
-                     GAIN_STAGING_MAX_MOVE_DB)
-        if abs(move) >= 1.0:
-            recipe.append(_action("fader", target="stem", gain_db=round(move, 1),
-                                  stem=stem["path"], reason="gain_staging",
-                                  expect=_expect_delta("stem.integrated_lufs",
-                                                       round(move, 1), 1.0,
-                                                       stem=stem["path"])))
+        is_balance_stem = balance_move and stem["path"] == balance_move["stem"]
+        needed = GAIN_STAGING_TARGET_LUFS - lufs
+        if is_balance_stem:
+            balance_applied = True
+            combined = clamp(needed + balance_move["gain"],
+                             -GAIN_STAGING_MAX_MOVE_DB, GAIN_STAGING_MAX_MOVE_DB)
+            if abs(combined) >= 1.0:
+                recipe.append(_action("fader", target=balance_move["target"],
+                                      gain_db=round(combined, 1),
+                                      stem=stem["path"], reason="gain_staging",
+                                      expect=_expect_delta("stem.integrated_lufs",
+                                                           round(combined, 1), 1.0,
+                                                           stem=stem["path"])))
+        else:
+            move = clamp(needed, -GAIN_STAGING_MAX_MOVE_DB, GAIN_STAGING_MAX_MOVE_DB)
+            if abs(move) >= 1.0:
+                recipe.append(_action("fader", target="stem", gain_db=round(move, 1),
+                                      stem=stem["path"], reason="gain_staging",
+                                      expect=_expect_delta("stem.integrated_lufs",
+                                                           round(move, 1), 1.0,
+                                                           stem=stem["path"])))
+
+    if balance_move and not balance_applied:
+        recipe.append(_action("fader", target=balance_move["target"],
+                              gain_db=balance_move["gain"], stem=balance_move["stem"],
+                              expect=_expect_delta("stem.integrated_lufs",
+                                                   balance_move["gain"], 1.0,
+                                                   stem=balance_move["stem"])))
 
     # Phase before EQ: a cancelling stem gets polarity, not a filter. A missing
     # correlation is unmeasured, not a healthy 1.0 that silently skips the move.

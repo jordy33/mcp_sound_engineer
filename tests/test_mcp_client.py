@@ -183,6 +183,22 @@ def test_health_failure_names_the_upstream():
     assert not transport.tool_calls()
 
 
+def test_base_url_normalizes_trailing_slashes_and_avoids_double_slash():
+    c1 = McpClient("http://127.0.0.1:8765/mcp")
+    c2 = McpClient("http://127.0.0.1:8765/mcp/")
+    assert c1.base_url == "http://127.0.0.1:8765"
+    assert c2.base_url == "http://127.0.0.1:8765"
+    assert c1.base_url == c2.base_url
+
+    transport = _bridge()
+    client = McpClient("http://127.0.0.1:8765/mcp/", transport=transport)
+    client.health_check()
+    get_requests = [r for r in transport.requests if r["method"] == "GET"]
+    assert len(get_requests) == 1
+    assert get_requests[0]["url"] == "http://127.0.0.1:8765/health"
+    assert "//health" not in get_requests[0]["url"]
+
+
 def test_notification_failure_aborts_initialization():
     transport = _bridge()
     original = transport.handler

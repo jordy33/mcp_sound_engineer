@@ -34,7 +34,8 @@ send-back gates, dynamics, limiter, playback-normalization reference, dither).
 | ~20 MB disk | numpy plus the venv |
 
 No ffmpeg, no libsndfile, no system packages. WAV is read with the standard library; FLAC/OGG/AIFF
-need the optional `soundfile` extra.
+decode via `soundfile`, which is included in `requirements.txt` (installed automatically by
+`./start-sound-engineer-mcp.sh`) or as the optional `[formats]` extra in `pyproject.toml` (`pip install .[formats]`).
 
 ## 2. Getting a Jev key
 

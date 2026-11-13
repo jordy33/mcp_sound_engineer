@@ -186,7 +186,8 @@ def _sse_messages(body: str):
 class McpClient:
     def __init__(self, endpoint: str, timeout: float = DEFAULT_TIMEOUT,
                  transport=urllib_transport, health_check: bool = True):
-        self.endpoint = endpoint
+        clean = endpoint.rstrip("/")
+        self.endpoint = clean
         self.timeout = timeout
         self._transport = transport
         self._health_check_enabled = health_check
@@ -199,9 +200,10 @@ class McpClient:
 
     @property
     def base_url(self) -> str:
-        if self.endpoint.endswith("/mcp"):
-            return self.endpoint[:-4]
-        return self.endpoint.rstrip("/")
+        clean = self.endpoint.rstrip("/")
+        if clean.endswith("/mcp"):
+            return clean[:-4]
+        return clean
 
     # -- handshake ---------------------------------------------------------
     def health_check(self, timeout: float = 5) -> dict:

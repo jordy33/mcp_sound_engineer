@@ -472,6 +472,7 @@ class LoopRunner:
         self.operations: list = []
         self.warnings: list = []
         self.baseline = None
+        self.reference_bounce_settings = None
         self.stage = None
         self.exported_runs: list = []
         self.iterations: list = []
@@ -812,7 +813,15 @@ class LoopRunner:
                 self._stop("bounce_settings_unverified",
                            "bounce settings are not readable for %s"
                            % record["label"])
-        reference = (self.baseline or {}).get("bounce_settings")
+        reference = self.reference_bounce_settings
+        if reference is None:
+            reference = (self.baseline or {}).get("bounce_settings")
+            if reference is None and isinstance(settings, dict):
+                self.reference_bounce_settings = settings
+                reference = settings
+            elif reference is not None:
+                self.reference_bounce_settings = reference
+
         if reference is not None and isinstance(settings, dict) \
                 and settings != reference:
             self._stop("bounce_settings_changed",

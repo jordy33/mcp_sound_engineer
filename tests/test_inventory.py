@@ -460,11 +460,14 @@ def test_inventory_file_keyed_by_target():
         os.unlink(path)
     assert source.single is False
     chain = source.chain_for(["vocal", "01_vocals.wav"], selector={"track": 3})
-    assert chain is not None and chain.reliable is True
+    assert chain is not None and chain.reliable is True and chain.key == "vocal"
+    # When earlier key is missing, chain.key must reflect the matched later key, not keys[0]
+    chain_fallback = source.chain_for(["missing_first", "vocal"], selector={"track": 3})
+    assert chain_fallback is not None and chain_fallback.key == "vocal"
     assert source.response_for(["01_vocals.wav"], single_target=True) is None
     assert source.chain_for(["missing"], selector={"track": 3}) is None
     master = source.chain_for(["master"], selector=MASTER_SELECTOR)
-    assert master.reliable is True and master.is_master is True
+    assert master.reliable is True and master.is_master is True and master.key == "master"
 
 
 def test_inventory_file_with_a_single_response():
@@ -474,8 +477,9 @@ def test_inventory_file_with_a_single_response():
     finally:
         os.unlink(path)
     assert source.single is True
-    assert source.chain_for(["vocal"], single_target=True,
-                            selector={"track": 3}).reliable is True
+    chain = source.chain_for(["vocal"], single_target=True, selector={"track": 3})
+    assert chain.reliable is True
+    assert chain.key == "*", "chain key should be '*' when matched via single-target fallback"
     assert source.response_for(["vocal"], single_target=False) is None
 
 

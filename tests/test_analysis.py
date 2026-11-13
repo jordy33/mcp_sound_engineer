@@ -366,6 +366,17 @@ def test_sections_refuses_to_flag_two_windows():
     assert facts["flagged_windows"] == []
 
 
+def test_analyze_sections_rejects_non_positive_window():
+    wav = _wav(np.zeros(SR * 2))
+    for bad_window in (0, 0.0, -1, -5.0):
+        try:
+            analysis.analyze_sections(wav, window_s=bad_window)
+        except ValueError as exc:
+            assert "window_s must be > 0" in str(exc), exc
+        else:
+            raise AssertionError(f"window_s={bad_window} must raise ValueError")
+
+
 def test_reference_curve_is_measurable():
     t = np.arange(SR * 5) / SR
     ref = analysis.analyze_reference(_wav(0.3 * np.sin(2 * np.pi * 80 * t)))

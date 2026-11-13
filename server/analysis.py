@@ -800,6 +800,8 @@ def analyze_sections(path: str, window_s: float = 30.0) -> dict:
     The final window may be partial (>= 5 s); a shorter remainder is reported as
     `tail_dropped_s` instead of vanishing.
     """
+    if window_s <= 0:
+        raise ValueError("window_s must be > 0")
     data, sr = load(path)
     win = int(window_s * sr)
     total = data.shape[0]

@@ -649,10 +649,16 @@ def _call(tool: str, command: str, params: dict, *, kind: str, target: dict,
     return call
 
 
-def _mixer_call(command: str, target: dict, value: float) -> dict:
+def _mixer_call(command: str, target: dict, value: float, *,
+                delta_db: float | None = None, calibration=None) -> dict:
     params = {"track": target["track"], "value": value}
-    return _call(contract.TOOL_MIXER, command, params, kind="write",
+    call = _call(contract.TOOL_MIXER, command, params, kind="write",
                  target=target, insert=None)
+    if delta_db is not None:
+        call["delta_db"] = delta_db
+    if calibration is not None:
+        call["fader_calibration"] = calibration
+    return call
 
 
 # ---------------------------------------------------------------------------
@@ -710,7 +716,13 @@ def _build_step(index, action, resolution, prepared, project_path,
             step["why"] = step["hint"]
             return step
         if name == "fader":
-            value = db_to_fader(action.get("gain_db", 0.0), fader_calibration)
+            gain_db = action.get("gain_db", 0.0)
+            if not _is_number(gain_db):
+                step.update(status="unresolved", reason="fader_gain_invalid",
+                            why="fader.gain_db must be a finite number")
+                return step
+            gain_db = float(gain_db)
+            value = db_to_fader(gain_db, fader_calibration)
             if value is None:
                 step.update(
                     status="needs_calibration", reason="fader_calibration_required",
@@ -718,7 +730,10 @@ def _build_step(index, action, resolution, prepared, project_path,
                          "not dB; run adapter.calibrate_fader on a scratch track "
                          "and pass --fader-calibration"))
                 return step
-            step["calls"] = [_mixer_call("set_volume", target, value)]
+            step["gain_db"] = gain_db
+            step["calls"] = [_mixer_call("set_volume", target, value,
+                                         delta_db=gain_db,
+                                         calibration=fader_calibration)]
             return step
         position = action.get("position", 0.0)
         if not _is_number(position):
@@ -788,6 +803,30 @@ def summary(steps: list[dict]) -> dict:
     }
 
 
+def _read_current_fader_level(client, track: int, timeout: float,
+                              cache: dict) -> tuple[float | None, str | None]:
+    if "mixer" not in cache:
+        if not hasattr(client, "read_resource"):
+            return None, "client does not support read_resource"
+        try:
+            res = client.read_resource("logic://mixer", timeout=timeout)
+        except Exception as exc:  # noqa: BLE001
+            return None, "error reading logic://mixer: %s" % exc
+        if not getattr(res, "ok", False):
+            return None, "logic://mixer resource read failed: %s" % getattr(res, "error", "unknown error")
+        cache["mixer"] = getattr(res, "payload", {}) or {}
+
+    payload = cache["mixer"]
+    tracks = payload.get("tracks") or payload.get("strips") or []
+    track_entry = next((t for t in tracks if isinstance(t, dict) and t.get("index") == track), None)
+    if track_entry is None:
+        return None, "track %s not found in logic://mixer" % track
+    vol = track_entry.get("volume")
+    if not _is_number(vol):
+        return None, "track %s volume in logic://mixer is not a finite number: %r" % (track, vol)
+    return float(vol), None
+
+
 # ---------------------------------------------------------------------------
 # apply with Honest Contract gating
 # ---------------------------------------------------------------------------
@@ -816,6 +855,7 @@ def apply_steps(steps: list[dict], endpoint: str = "http://127.0.0.1:8765/mcp",
     target_bands = _target_bands(steps, phases)
     eq_state_checked: set[str] = set()
     skipped_targets: set[str] = set()
+    mixer_cache: dict = {}
     stop = False
     try:
         for index, step in _ordered(steps, phases):
@@ -849,6 +889,54 @@ def apply_steps(steps: list[dict], endpoint: str = "http://127.0.0.1:8765/mcp",
                         stop = True
                     break
 
+                if call.get("tool") == contract.TOOL_MIXER and call.get("arguments", {}).get("command") == "set_volume":
+                    track_idx = prepared["arguments"]["params"].get("track")
+                    current_level, why = _read_current_fader_level(client, track_idx, timeout, mixer_cache)
+                    if why is not None:
+                        results.append({
+                            "step": index, "call": number, "kind": call.get("kind"),
+                            "operation": _operation(call), "target_key": target_key,
+                            "state": None, "verified": False, "success": None, "hc_schema": None,
+                            "reason": "unresolved_fader_level", "error": why,
+                            "write_attempted": False, "payload": {},
+                            "index": index, "action": step.get("action"),
+                            "detail": "needs_inventory: %s" % why,
+                            "status": "unresolved", "reason_code": "needs_inventory",
+                        })
+                        skipped_targets.add(target_key)
+                        if not continue_on_error:
+                            stop = True
+                        break
+                    delta_db = call.get("delta_db", 0.0)
+                    target_db = current_level + delta_db
+                    cal = call.get("fader_calibration")
+                    target_val = db_to_fader(target_db, cal)
+                    if target_val is None:
+                        results.append({
+                            "step": index, "call": number, "kind": call.get("kind"),
+                            "operation": _operation(call), "target_key": target_key,
+                            "state": None, "verified": False, "success": None, "hc_schema": None,
+                            "reason": "fader_out_of_bounds",
+                            "error": "fader calibration cannot map %.2f dB" % target_db,
+                            "write_attempted": False, "payload": {},
+                            "index": index, "action": step.get("action"),
+                            "detail": "needs_calibration: fader calibration cannot map %.2f dB" % target_db,
+                            "status": "unresolved", "reason_code": "needs_calibration",
+                        })
+                        skipped_targets.add(target_key)
+                        if not continue_on_error:
+                            stop = True
+                        break
+                    prepared["arguments"]["params"]["value"] = target_val
+                    try:
+                        contract.validate_call(prepared)
+                    except contract.ContractViolation:
+                        results.append(_contract_failure(index, step, number, call))
+                        skipped_targets.add(target_key)
+                        if not continue_on_error:
+                            stop = True
+                        break
+
                 if _is_eq_write(call) and not _is_master_target(call):
                     binding = bindings.get(target_key)
                     ref = ((binding or {}).get("ref")
@@ -875,6 +963,14 @@ def apply_steps(steps: list[dict], endpoint: str = "http://127.0.0.1:8765/mcp",
 
                 if binding := bindings.get(target_key):
                     prepared = _rebind(prepared, binding)
+                    try:
+                        contract.validate_call(prepared)
+                    except contract.ContractViolation:
+                        results.append(_contract_failure(index, step, number, call))
+                        skipped_targets.add(target_key)
+                        if not continue_on_error:
+                            stop = True
+                        break
 
                 result = _send(client, prepared, timeout)
                 entry = _entry(index, step, number, call, result)
@@ -966,10 +1062,14 @@ def _prepare_call(call: dict) -> dict | None:
 
 def _rebind(prepared: dict, binding: dict) -> dict:
     params = prepared["arguments"]["params"]
-    ref = binding.get("ref")
-    if ref and "track" in params:
+    if "ref" in binding and "track" in params:
         params.pop("track", None)
-        params["target_ref"] = ref
+        params["target_ref"] = binding["ref"]
+    elif "target_ref" in binding and "track" in params:
+        params.pop("track", None)
+        params["target_ref"] = binding["target_ref"]
+    elif "target_ref" in binding:
+        params["target_ref"] = binding["target_ref"]
     if binding.get("insert") is not None:
         params["insert"] = binding["insert"]
     return prepared

@@ -586,12 +586,14 @@ def test_summary_counts_calls_and_inserts():
 # apply: Honest Contract gating
 # ---------------------------------------------------------------------------
 class FakeClient:
-    def __init__(self, results=None, inventories=None, eq_state=None):
+    def __init__(self, results=None, inventories=None, eq_state=None, mixer_resource=None):
         self.results = list(results or [])
         self.inventories = list(inventories or [])
         self.eq_state = eq_state
+        self.mixer_resource = mixer_resource
         self.calls = []
         self.inventory_reads = 0
+        self.resource_reads = []
 
     def call_tool(self, tool, arguments, timeout=None):
         self.calls.append((tool, dict(arguments)))
@@ -607,6 +609,15 @@ class FakeClient:
         if not self.inventories:
             raise AssertionError("unexpected inventory read")
         return self.inventories.pop(0)
+
+    def read_resource(self, uri, timeout=None):
+        self.resource_reads.append(uri)
+        if self.mixer_resource is not None:
+            return self.mixer_resource
+        return ToolResult(
+            ok=True,
+            payload={"tracks": [{"index": i, "volume": 0.0} for i in range(1, 10)]},
+            tool="resources/read", command=uri)
 
     def close(self):
         pass
@@ -722,6 +733,81 @@ def test_apply_write_attempted_state_c_is_partial_and_stops_even_with_continue()
     assert len(client.calls) == 1
 
 
+def test_fader_relative_move_computed_from_mixer_resource():
+    # Fader sitting at -5.0 dB receiving gain_db=-2.0 must write target -7.0 dB
+    tracks = {"vocal": {"index": 3, "name": "Lead Vocal"}}
+    recipe = [_action("fader", "vocal", gain_db=-2.0)]
+    steps = plan(recipe, tracks, None, PROJECT, CALIBRATION)
+
+    mixer_resource = ToolResult(
+        ok=True,
+        payload={"tracks": [{"index": 3, "volume": -5.0}]},
+        tool="resources/read", command="logic://mixer")
+    client = FakeClient([_ok({"write_attempted": True}, tool=contract.TOOL_MIXER)],
+                        mixer_resource=mixer_resource)
+
+    results = apply_steps(steps, client=client)
+    assert len(results) == 1
+    assert results[0]["status"] == "applied"
+    assert len(client.calls) == 1
+    tool, args = client.calls[0]
+    assert tool == contract.TOOL_MIXER
+    assert args["command"] == "set_volume"
+    assert args["params"]["track"] == 3
+    # CALIBRATION: [[-18.0, 0.1], [-12.0, 0.2], [-6.0, 0.5], [0.0, 0.8]]
+    # target_db = -5.0 + (-2.0) = -7.0 dB -> 0.2 + (5/6)*(0.3) = 0.45
+    expected_val = db_to_fader(-7.0, CALIBRATION)
+    assert expected_val is not None
+    assert abs(args["params"]["value"] - expected_val) < 1e-6
+
+
+def test_fader_at_zero_db_maintains_baseline_behavior():
+    tracks = {"vocal": {"index": 3, "name": "Lead Vocal"}}
+    recipe = [_action("fader", "vocal", gain_db=-6.0)]
+    steps = plan(recipe, tracks, None, PROJECT, CALIBRATION)
+
+    mixer_resource = ToolResult(
+        ok=True,
+        payload={"tracks": [{"index": 3, "volume": 0.0}]},
+        tool="resources/read", command="logic://mixer")
+    client = FakeClient([_ok({"write_attempted": True}, tool=contract.TOOL_MIXER)],
+                        mixer_resource=mixer_resource)
+
+    results = apply_steps(steps, client=client)
+    assert len(results) == 1
+    assert results[0]["status"] == "applied"
+    tool, args = client.calls[0]
+    assert args["params"]["value"] == 0.5
+
+
+def test_fader_fails_closed_when_mixer_level_unreadable():
+    tracks = {"vocal": {"index": 3, "name": "Lead Vocal"}}
+    recipe = [_action("fader", "vocal", gain_db=-2.0)]
+    steps = plan(recipe, tracks, None, PROJECT, CALIBRATION)
+
+    # Case 1: Track missing from mixer resource
+    mixer_missing = ToolResult(
+        ok=True, payload={"tracks": [{"index": 99, "volume": 0.0}]},
+        tool="resources/read", command="logic://mixer")
+    client_missing = FakeClient(mixer_resource=mixer_missing)
+    results_missing = apply_steps(steps, client=client_missing)
+    assert len(results_missing) == 1
+    assert results_missing[0]["status"] == "unresolved"
+    assert results_missing[0]["reason_code"] == "needs_inventory"
+    assert len(client_missing.calls) == 0
+
+    # Case 2: Non-numeric volume
+    mixer_non_numeric = ToolResult(
+        ok=True, payload={"tracks": [{"index": 3, "volume": "unknown"}]},
+        tool="resources/read", command="logic://mixer")
+    client_non_numeric = FakeClient(mixer_resource=mixer_non_numeric)
+    results_non_numeric = apply_steps(steps, client=client_non_numeric)
+    assert len(results_non_numeric) == 1
+    assert results_non_numeric[0]["status"] == "unresolved"
+    assert results_non_numeric[0]["reason_code"] == "needs_inventory"
+    assert len(client_non_numeric.calls) == 0
+
+
 def test_apply_insert_failure_blocks_parameter_writes():
     client = FakeClient([_state_c("slot_occupied", write_attempted=False)])
     results = apply_steps(_bell_steps(), client=client)
@@ -730,6 +816,26 @@ def test_apply_insert_failure_blocks_parameter_writes():
         arguments["command"] == "set_eq_band_verified"
         for _tool, arguments in client.calls)
     assert len(results) == 1
+
+
+def test_apply_rebind_validates_contract_and_rejects_bad_refs():
+    # A forged or malformed ref in bindings must be caught by contract validation after _rebind
+    client = FakeClient()
+    steps = _bell_steps(track=3)
+    bad_bindings_empty = {"track:3": {"ref": "", "ready": True, "insert": 1}}
+    results = apply_steps(steps, client=client, bindings=bad_bindings_empty)
+    assert len(results) == 1
+    assert results[0]["status"] == "error"
+    assert results[0]["reason"] == "contract_violation"
+    assert len(client.calls) == 0
+
+    client2 = FakeClient()
+    bad_bindings_int = {"track:3": {"target_ref": -1, "ready": True, "insert": 1}}
+    results2 = apply_steps(steps, client=client2, bindings=bad_bindings_int)
+    assert len(results2) == 1
+    assert results2[0]["status"] == "error"
+    assert results2[0]["reason"] == "contract_violation"
+    assert len(client2.calls) == 0
 
 
 def test_apply_continue_on_error_skips_only_dependent_calls():

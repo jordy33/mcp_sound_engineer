@@ -211,6 +211,35 @@ def test_verify_recipe_checks_measurements_after_the_bounce():
     assert result["all_met"] is False, result
 
 
+def test_verify_recipe_rejects_duplicate_stem_basenames():
+    with tempfile.TemporaryDirectory() as tmp:
+        before = os.path.join(tmp, "before.wav")
+        after = os.path.join(tmp, "after.wav")
+        make_wav(before)
+        make_wav(after)
+        d1 = os.path.join(tmp, "take1")
+        d2 = os.path.join(tmp, "take2")
+        os.makedirs(d1)
+        os.makedirs(d2)
+        s1 = os.path.join(d1, "vocal.wav")
+        s2 = os.path.join(d2, "vocal.wav")
+        make_wav(s1)
+        make_wav(s2)
+        recipe = [
+            {"id": "vocal_fader", "action": "fader", "target": "vocal",
+             "schema": engineer_server.rules.RECIPE_SCHEMA_VERSION,
+             "gain_db": -2.0, "stem": "vocal.wav",
+             "expect": {"metric": "stem.integrated_lufs", "delta_db": -2.0,
+                        "tolerance_db": 1.0, "stem": "vocal.wav"}},
+        ]
+        try:
+            engineer_server.tool_verify_recipe(recipe, before, after, before_stems=[s1, s2])
+        except ValueError as exc:
+            assert "duplicate stem basename 'vocal'" in str(exc), exc
+        else:
+            raise AssertionError("duplicate stem basenames must raise ValueError")
+
+
 def test_jev_state_contains_basenames_not_local_paths():
     facts = {
         "file": "/Users/alice/Music/master.wav",
@@ -297,6 +326,19 @@ def test_judge_master_passes_measured_reference_and_intent():
     assert result["recipe"] == [], result
 
 
+def test_judge_master_rejects_non_numeric_desired_lufs():
+    with tempfile.TemporaryDirectory() as tmp:
+        path = os.path.join(tmp, "master.wav")
+        make_wav(path)
+        for bad in ("loud", True, False, [1]):
+            try:
+                engineer_server.tool_judge_master(path, desired_lufs=bad)
+            except ValueError as exc:
+                assert "desired_lufs must be a finite number" in str(exc), exc
+            else:
+                raise AssertionError(f"desired_lufs={bad!r} must raise ValueError")
+
+
 def _free_port() -> int:
     with socket.socket() as sock:
         sock.bind(("127.0.0.1", 0))
@@ -317,8 +359,8 @@ def _wait_health(port: int, timeout: float = 10.0) -> None:
     raise AssertionError("the HTTP server did not start")
 
 
-def test_judge_master_short_file_returns_a_terminal_recipe():
-    """A <3 s file has no LRA; the gate refuses it instead of crashing."""
+def test_judge_master_short_file_does_not_refuse_unmeasured_lra():
+    """A <3 s file has no LRA; evaluate_gates accepts it without crashing."""
     original_ask = engineer_server.ask
     engineer_server.ask = lambda state, questions: _master_answers()
     try:
@@ -329,8 +371,7 @@ def test_judge_master_short_file_returns_a_terminal_recipe():
     finally:
         engineer_server.ask = original_ask
     recipe = result["recipe"]
-    assert len(recipe) == 1 and recipe[0]["action"] == "send_back", recipe
-    assert any("unmeasured:loudness.loudness_range_lu" in r for r in recipe[0]["reasons"]), recipe
+    assert not any(a.get("action") == "send_back" for a in recipe), recipe
 
 
 def test_http_rejects_foreign_host_origin_and_oversized_body():
@@ -386,6 +427,68 @@ def test_http_rejects_foreign_host_origin_and_oversized_body():
     finally:
         proc.terminate()
         proc.wait(timeout=5)
+
+
+def test_run_http_port_in_use_detects_eaddrinuse_cross_platform():
+    import errno
+    import io
+    from unittest.mock import patch
+
+    # Test both EADDRINUSE (macOS/Linux) and WSAEADDRINUSE (Windows)
+    for err in (errno.EADDRINUSE, getattr(errno, "WSAEADDRINUSE", 10048)):
+        buf = io.StringIO()
+        with patch.object(errno, "WSAEADDRINUSE", 10048, create=True):
+            with patch("http.server.ThreadingHTTPServer", side_effect=OSError(err, "Address already in use")):
+                with patch("sys.stdout", buf):
+                    try:
+                        engineer_server.serve_http(9999)
+                    except SystemExit as exc:
+                        assert exc.code == 2
+                        assert "port 9999 is already in use" in buf.getvalue()
+                    else:
+                        raise AssertionError(f"expected SystemExit(2) for errno {err}")
+
+
+def test_judge_mix_formats_gate_warnings_as_sentences():
+    # Directly test formatting function
+    mono_bass_gate = {"gate": "mono_bass", "stem": "02_bass.wav", "low_correlation": -0.15}
+    formatted = engineer_server._format_gate_warning(mono_bass_gate)
+    assert "02_bass.wav: low-band phase correlation (-0.15) is below 0.3" in formatted
+    assert "collapse low frequencies to mono" in formatted
+    assert "{" not in formatted  # No raw dict dump
+
+    # Custom gate fallback
+    custom_gate = {"gate": "custom_warning", "stem": "03_guitar.wav", "issue_db": 4.5}
+    formatted_custom = engineer_server._format_gate_warning(custom_gate)
+    assert formatted_custom == "gate custom_warning: stem 03_guitar.wav; issue_db 4.5"
+    assert "{" not in formatted_custom
+
+    # Test via tool_judge_mix with mocked ask and analyze_stems returning a mono_bass gate
+    original_ask = engineer_server.ask
+    original_analyze = engineer_server.analyze_stems
+    engineer_server.ask = lambda state, questions: {
+        "balance": {"choice": "balanced", "confidence": 0.95},
+        "masking": {"score": 2.0, "confidence": 0.95},
+        "bus_comp": {"choice": "none", "confidence": 0.95},
+        "phase_before_eq": {"choice": "clean", "confidence": 0.95},
+        "hpf_policy": {"choice": "none", "confidence": 0.95},
+    }
+    engineer_server.analyze_stems = lambda paths: {
+        "stems": [
+            {"path": "01_vocals.wav", "name": "01_vocals.wav", "integrated_lufs": -18.0},
+            {"path": "02_bass.wav", "name": "02_bass.wav", "integrated_lufs": -18.0,
+             "low_instrument": True, "low_correlation": -0.2},
+        ],
+        "band_overlap_pairs": [],
+        "gates": [mono_bass_gate],
+    }
+    try:
+        result = engineer_server.tool_judge_mix(["01_vocals.wav", "02_bass.wav"])
+        assert any("02_bass.wav: low-band phase correlation" in w for w in result["warnings"]), result["warnings"]
+        assert not any("mono_bass: {" in w for w in result["warnings"]), result["warnings"]
+    finally:
+        engineer_server.ask = original_ask
+        engineer_server.analyze_stems = original_analyze
 
 
 if __name__ == "__main__":

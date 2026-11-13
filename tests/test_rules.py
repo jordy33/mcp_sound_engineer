@@ -155,6 +155,24 @@ def test_noise_floor_none_means_no_silence_not_unmeasured():
     assert "unmeasured:noise.floor_dbfs" not in gates["reasons"], gates
 
 
+def test_loudness_range_none_means_short_file_not_unmeasured():
+    # Key present with value None: measured-but-unavailable on sub-3s files
+    facts = _master_facts(loudness={"integrated_lufs": -18.0, "true_peak_dbtp": -1.0,
+                                    "loudness_range_lu": None})
+    gates = rules.evaluate_gates(facts)
+    assert gates["complete"] is True, gates
+    assert gates["send_back"] is False, gates
+    assert "unmeasured:loudness.loudness_range_lu" not in gates["reasons"], gates
+
+    # Missing key: unmeasured
+    facts_missing = _master_facts()
+    del facts_missing["loudness"]["loudness_range_lu"]
+    gates_missing = rules.evaluate_gates(facts_missing)
+    assert gates_missing["complete"] is False, gates_missing
+    assert gates_missing["send_back"] is True, gates_missing
+    assert "unmeasured:loudness.loudness_range_lu" in gates_missing["reasons"], gates_missing
+
+
 def test_unmeasured_gate_turns_the_recipe_into_a_terminal_send_back():
     facts = _master_facts()
     del facts["stereo"]["phase_correlation"]
@@ -453,6 +471,38 @@ def test_no_stem_match_means_no_invented_fader():
                                   ["mixdown.wav"]) == []
 
 
+def test_build_mix_recipe_folds_balance_into_gain_staging():
+    # Reproduction from fix.md: balance=vocal_too_high (-2 dB), vocal stem at -14 LUFS (gain staging -4 dB)
+    # Must yield a single fader action on vocal with combined clamped move of -6.0 dB.
+    answers = _mix_answers(balance={"choice": "vocal_too_high"})
+    stems = ["01_vocals.wav", "02_drums.wav"]
+    stem_facts = [
+        {"path": "01_vocals.wav", "integrated_lufs": -14.0},
+        {"path": "02_drums.wav", "integrated_lufs": -18.0},
+    ]
+    recipe = rules.build_mix_recipe(answers, stems, stem_facts)
+    vocal_faders = [a for a in recipe if a.get("action") == "fader" and a.get("stem") == "01_vocals.wav"]
+    assert len(vocal_faders) == 1
+    assert vocal_faders[0]["gain_db"] == -6.0
+    assert vocal_faders[0]["expect"]["delta_db"] == -6.0
+
+
+def test_build_mix_recipe_never_emits_duplicate_faders_on_same_stem():
+    # Combinations of balance choices and various stem LUFS levels
+    for balance_choice in ("balanced", "vocal_too_high", "drums_too_loud", "bass_too_heavy"):
+        for vocal_lufs in (-10.0, -14.0, -18.0, -22.0, None):
+            answers = _mix_answers(balance={"choice": balance_choice})
+            stems = ["01_vocals.wav", "02_drums.wav", "03_bass.wav"]
+            stem_facts = [{"path": "01_vocals.wav"}]
+            if vocal_lufs is not None:
+                stem_facts[0]["integrated_lufs"] = vocal_lufs
+            recipe = rules.build_mix_recipe(answers, stems, stem_facts)
+            fader_stems = [a["stem"] for a in recipe if a.get("action") == "fader"]
+            assert len(fader_stems) == len(set(fader_stems)), (
+                f"duplicate faders found for {balance_choice}, {vocal_lufs}: {recipe}"
+            )
+
+
 # --- contract ---------------------------------------------------------------
 def test_recipe_never_reads_a_key_the_schema_lacks():
     """The test that would have caught low_end/low_mid and vocal_forward."""
@@ -711,6 +761,17 @@ def test_mono_compatibility_warning():
                                                                "true_peak_dbtp": -1.2}}
     warnings = rules.loudness_warnings(facts, rules.PLATFORMS["spotify"])
     assert any("mono fold-down" in w for w in warnings), warnings
+
+
+def test_loudness_warnings_hardened_against_non_numeric_inputs():
+    target = rules.loudness_target("spotify")
+    facts = {
+        "loudness": {"integrated_lufs": None, "true_peak_dbtp": "invalid"},
+        "stereo": {"mono_cancel_db": "corrupted"},
+        "noise": {"floor_dbfs": [1, 2, 3]},
+    }
+    warnings = rules.loudness_warnings(facts, target)
+    assert isinstance(warnings, list)
 
 
 def test_mix_masking_clamp_is_reported_not_hidden():
@@ -1019,6 +1080,29 @@ def test_require_rejects_out_of_domain_answers():
             assert expected in str(exc), (expected, exc)
         else:
             raise AssertionError(f"{expected} must be rejected")
+
+
+def test_require_rejects_non_dict_extra_answers():
+    answers = _answers()
+    # Non-dict extra answer (e.g. int) must raise ValueError, never TypeError
+    try:
+        rules.require(dict(answers, extra=7), rules.MASTER_QUESTIONS)
+    except ValueError as exc:
+        assert "extra must be an object" in str(exc), exc
+    except Exception as exc:
+        raise AssertionError(f"expected ValueError, got {type(exc).__name__}: {exc}") from exc
+    else:
+        raise AssertionError("non-dict extra answer must be rejected")
+
+    # String extra answer containing 'noul' substring must raise ValueError, never TypeError
+    try:
+        rules.require(dict(answers, extra="contains noul text"), rules.MASTER_QUESTIONS)
+    except ValueError as exc:
+        assert "extra must be an object" in str(exc), exc
+    except Exception as exc:
+        raise AssertionError(f"expected ValueError, got {type(exc).__name__}: {exc}") from exc
+    else:
+        raise AssertionError("string extra answer must be rejected")
 
 
 def test_confidence_report_separates_low_from_unknown():
